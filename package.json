@@ -1,0 +1,28 @@
+{
+  "name": "sure-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monitor de arbitragem (surebet) de eSports entre Polymarket e Thunderpick em tempo real",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "sim": "tsx src/index.ts --simulator",
+    "test": "tsx --test test/engine.test.ts test/matching.test.ts test/thunderpick.test.ts test/betby.test.ts test/value.test.ts test/markets.test.ts test/persistence.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.5.12",
+    "playwright": "^1.64.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

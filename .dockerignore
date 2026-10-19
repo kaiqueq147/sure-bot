@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.env
+captures
+.thunderpick-profile
+data
+test
+*.log
+*.md
