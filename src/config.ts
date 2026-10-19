@@ -71,6 +71,10 @@ export const config = {
     apiBase: env('DUEL_API_BASE', 'https://api-a-c7818b61-600.sptpub.com/api/v4'),
     brandId: env('DUEL_BRAND_ID', '2482975601191952386'),
     siteUrl: env('DUEL_SITE_URL', 'https://duel.com'),
+    userAgent: env(
+      'DUEL_USER_AGENT',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    ),
     lang: env('DUEL_LANG', 'en'),
     liveIntervalMs: num('DUEL_LIVE_INTERVAL_MS', 2_000),
     prematchIntervalMs: num('DUEL_PREMATCH_INTERVAL_MS', 5_000),

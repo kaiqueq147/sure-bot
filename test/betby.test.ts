@@ -67,7 +67,7 @@ test('fonte aplica snapshot e delta, gera link e trata evento nulo', async () =>
 
   try {
     const src = new BetbySource(store, {
-      book: 'duel', apiBase: base, brandId: 'b', siteUrl: 'https://duel.com', lang: 'en',
+      book: 'duel', apiBase: base, brandId: 'b', siteUrl: 'https://duel.com', userAgent: 'test-agent', lang: 'en',
       liveIntervalMs: 20, prematchIntervalMs: 20,
     });
     src.start();
