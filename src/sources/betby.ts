@@ -74,6 +74,7 @@ export interface BetbyOptions {
   apiBase: string;
   brandId: string;
   siteUrl: string;
+  userAgent: string;
   lang: string;
   liveIntervalMs: number;
   prematchIntervalMs: number;
@@ -211,8 +212,27 @@ export class BetbySource implements Source {
   }
 
   private async get<T>(url: string): Promise<T> {
-    const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status} em ${url}`);
+    const origin = new URL(this.opts.siteUrl).origin;
+    const res = await fetch(url, {
+      headers: {
+        'user-agent': this.opts.userAgent,
+        accept: 'application/json, text/plain, */*',
+        'accept-language': 'en-US,en;q=0.9',
+        origin,
+        referer: `${origin}/`,
+        'sec-fetch-site': 'cross-site',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty',
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      const body = (await res.text().catch(() => '')).slice(0, 200);
+      const h = (name: string) => res.headers.get(name) ?? '-';
+      throw new Error(
+        `HTTP ${res.status} em ${url} [server=${h('server')} cf-ray=${h('cf-ray')} x-cache=${h('x-cache')}] corpo: ${body}`,
+      );
+    }
     return (await res.json()) as T;
   }
 
