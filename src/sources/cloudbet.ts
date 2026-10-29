@@ -321,7 +321,8 @@ export class CloudbetSource implements Source {
   private slowdown = 1;
   private lastFullAt = 0;
   private lastSportsLiveAt = 0;
-  private lastSportsAllAt = 0;
+  /** Esporte -> última tentativa da busca completa (um esporte por volta, em rodízio) */
+  private readonly lastSportAllAt = new Map<string, number>();
   private lastOkAt?: number;
   private state: SourceStatus['state'] = 'idle';
   private detail?: string;
@@ -355,14 +356,14 @@ export class CloudbetSource implements Source {
     };
   }
 
-  private url(live: boolean, scope: Scope = 'esports'): string {
+  private url(live: boolean, scope: Scope = 'esports', only?: string): string {
     const u = new URL(`${this.opts.apiBase}/sports/events`);
     u.searchParams.set('limit', '999');
     u.searchParams.set('locale', this.opts.lang);
     u.searchParams.set('include-all-event-types', 'false');
     // Sem `live` vêm todos os jogos (ao vivo e pré-jogo).
     if (live) u.searchParams.set('live', 'true');
-    const sports = scope === 'esports' ? this.opts.sports : (this.opts.traditionalSports ?? []);
+    const sports = only ? [only] : scope === 'esports' ? this.opts.sports : (this.opts.traditionalSports ?? []);
     for (const s of sports) {
       u.searchParams.append('sports', s);
       const markets = scope === 'esports' ? MARKETS : traditionalMarketKeys(s);
@@ -411,9 +412,18 @@ export class CloudbetSource implements Source {
    * no mesmo ciclo, em cadência própria, sem aumentar o número de requisições: ganham a vez de
    * uma volta que seria só dos eSports ao vivo.
    */
-  private nextTask(now: number): { scope: Scope; full: boolean } {
-    const sports = (this.opts.traditionalSports ?? []).length > 0;
-    if (sports && now - this.lastSportsAllAt >= (this.opts.sportsAllIntervalMs ?? 60_000)) return { scope: 'sports', full: true };
+  /**
+   * Próxima requisição. A busca completa dos esportes sai um esporte por vez (o esporte com a busca
+   * mais antiga): a de todos juntos passava de 15 MB e estourava o timeout.
+   */
+  private nextTask(now: number): { scope: Scope; full: boolean; sport?: string } {
+    const trad = this.opts.traditionalSports ?? [];
+    const sports = trad.length > 0;
+    const due = trad
+      .map((sp) => ({ sp, at: this.lastSportAllAt.get(sp) ?? 0 }))
+      .filter(({ at }) => now - at >= (this.opts.sportsAllIntervalMs ?? 60_000))
+      .sort((a, b) => a.at - b.at)[0];
+    if (due) return { scope: 'sports', full: true, sport: due.sp };
     if (now - this.lastFullAt >= this.opts.allIntervalMs) return { scope: 'esports', full: true };
     if (sports && now - this.lastSportsLiveAt >= (this.opts.sportsLiveIntervalMs ?? 5_000)) return { scope: 'sports', full: false };
     return { scope: 'esports', full: false };
@@ -428,18 +438,24 @@ export class CloudbetSource implements Source {
       'esports:live': this.url(true, 'esports'),
       'esports:all': this.url(false, 'esports'),
       'sports:live': this.url(true, 'sports'),
-      'sports:all': this.url(false, 'sports'),
     };
+    for (const sp of this.opts.traditionalSports ?? []) urls[`sports:all:${sp}`] = this.url(false, 'sports', sp);
     let failures = 0;
     while (!this.stopped) {
       await this.waitCooldown();
       if (this.stopped) break;
       const startedAt = Date.now();
-      const { scope, full } = this.nextTask(startedAt);
+      const { scope, full, sport } = this.nextTask(startedAt);
+      // A tentativa conta mesmo se falhar: senão a mesma busca seria repetida para sempre e as
+      // outras (inclusive o eSports ao vivo) nunca rodariam.
+      if (sport) this.lastSportAllAt.set(sport, startedAt);
+      else if (scope === 'sports') this.lastSportsLiveAt = startedAt;
+      else if (full) this.lastFullAt = startedAt;
       try {
-        const res = await fetch(urls[`${scope}:${full ? 'all' : 'live'}`], {
+        const res = await fetch(urls[sport ? `sports:all:${sport}` : `${scope}:${full ? 'all' : 'live'}`], {
           headers: { accept: 'application/json' },
-          signal: AbortSignal.timeout(15_000),
+          // Listas completas são grandes (vários MB): mais tempo que o ao vivo.
+          signal: AbortSignal.timeout(full ? 45_000 : 15_000),
         });
         this.net.record(res.status);
         if (res.status === 429) {
@@ -453,11 +469,7 @@ export class CloudbetSource implements Source {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = (await res.json()) as CloudbetResponse;
         this.latency.add(Date.now() - startedAt);
-        this.ingest(body, !full, scope);
-        if (scope === 'sports') {
-          this.lastSportsLiveAt = startedAt;
-          if (full) this.lastSportsAllAt = startedAt;
-        } else if (full) this.lastFullAt = startedAt;
+        this.ingest(body, !full, scope, sport);
 
         failures = 0;
         this.slowdown = Math.max(1, this.slowdown * SLOWDOWN_DECAY);
@@ -474,7 +486,7 @@ export class CloudbetSource implements Source {
         await sleep(Math.max(0, jitter(base * this.slowdown) - (Date.now() - startedAt)));
       } catch (err) {
         failures++;
-        this.log.warn(`feed ${scope} ${full ? 'geral' : 'ao vivo'} falhou (${failures}x)`, err);
+        this.log.warn(`feed ${sport ?? scope} ${full ? 'geral' : 'ao vivo'} falhou (${failures}x)`, err);
         if (failures >= 3) {
           this.state = 'error';
           this.detail = (err as Error).message;
@@ -485,7 +497,7 @@ export class CloudbetSource implements Source {
     }
   }
 
-  private ingest(body: CloudbetResponse, live: boolean, scope: Scope = 'esports'): void {
+  private ingest(body: CloudbetResponse, live: boolean, scope: Scope = 'esports', only?: string): void {
     const now = Date.now();
     const seen = new Set<string>();
     const known = scope === 'esports' ? CLOUDBET_SPORTS : CLOUDBET_TRADITIONAL_SPORTS;
@@ -506,7 +518,7 @@ export class CloudbetSource implements Source {
     }
     for (const [id, t] of this.events) {
       // Cada busca só responde pelos eventos da própria lista (eSports x esportes tradicionais).
-      if (seen.has(id) || t.scope !== scope) continue;
+      if (seen.has(id) || t.scope !== scope || (only && t.sport !== only)) continue;
       // Saiu do ao vivo (acabou ou ainda está no geral): marca como não-ao-vivo para o geral assumir.
       if (live && t.live) t.live = false;
       if (now - t.seenAt > FORGET_MS || (!live && !t.live)) {

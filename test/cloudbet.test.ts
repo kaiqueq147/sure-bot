@@ -147,3 +147,34 @@ test('nunca pede mais de 7 mercados por esporte (a API responde 400 acima disso)
   }
   assert.ok(traditionalMarketKeys('soccer').includes('match_odds_period_first_half'), '1X2 do 1º tempo continua');
 });
+
+test('busca de esportes que sempre falha não trava as outras; cada esporte vai separado', async () => {
+  const store = new OddsStore();
+  const requested: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL) => {
+    const url = new URL(String(input));
+    const sports = url.searchParams.getAll('sports');
+    requested.push(`${sports.join('+')}${url.searchParams.get('live') ? ':live' : ':all'}`);
+    // Busca completa de esportes: falha sempre (como o timeout de 15 MB).
+    if (!url.searchParams.get('live') && !sports.includes('counter-strike')) return new Response('', { status: 500 });
+    return new Response(JSON.stringify({ sports: [] }), { headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const src = new CloudbetSource(store, {
+      apiBase: 'https://x', siteUrl: 'https://www.cloudbet.com', lang: 'en', sports: ['counter-strike'],
+      liveIntervalMs: 5, allIntervalMs: 60_000, traditionalSports: ['soccer', 'tennis'],
+      sportsAllIntervalMs: 60_000, sportsLiveIntervalMs: 60_000,
+    });
+    src.start();
+    await new Promise((r) => setTimeout(r, 400));
+    src.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.ok(requested.includes('soccer:all') && requested.includes('tennis:all'), 'um esporte por requisição');
+  assert.ok(!requested.includes('soccer+tennis:all'), 'nunca os esportes todos juntos');
+  assert.equal(requested.filter((r) => r === 'soccer:all').length, 1, 'falha não repete a mesma busca em seguida');
+  // Antes da correção, `soccer:all` se repetia para sempre e o eSports nunca era consultado.
+  assert.ok(requested.some((r) => r.startsWith('counter-strike')), 'eSports continua sendo consultado');
+});

@@ -1,6 +1,6 @@
 import type { OddsStore } from '../core/OddsStore.js';
 import { ReconnectingWebSocket } from '../core/ReconnectingWebSocket.js';
-import { createLogger } from '../core/logger.js';
+import { createLogger, sleep } from '../core/logger.js';
 import { Ewma } from '../core/Health.js';
 import { derivedQuoteFields, isHalfLine, isHandicapType, isMapNumber, marketKey, WINNER } from '../core/markets.js';
 import { depthOdds } from '../engine/math.js';
@@ -400,21 +400,40 @@ export class PolymarketSource implements Source {
       if (endMax) url.searchParams.set('end_date_max', endMax.toISOString());
       url.searchParams.set('limit', String(PAGE));
       url.searchParams.set('offset', String(offset));
-      const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-      this.net.record(res.status);
-      if (!res.ok) throw new Error(`Gamma ${res.status} ${res.statusText}`);
-      const page = (await res.json()) as GammaEvent[];
+      const page = await this.fetchPage(url);
       all.push(...page);
       if (page.length < PAGE) break;
     }
     return all;
   }
 
+  /** Uma página do Gamma: até 3 tentativas, 30s cada (páginas de esportes passam de 1 MB). */
+  private async fetchPage(url: URL): Promise<GammaEvent[]> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(30_000) });
+        this.net.record(res.status);
+        if (!res.ok) throw new Error(`Gamma ${res.status} ${res.statusText}`);
+        return (await res.json()) as GammaEvent[];
+      } catch (err) {
+        if (attempt >= 3) throw err;
+        await sleep(1_000 * attempt);
+      }
+    }
+  }
+
   private async discover(): Promise<void> {
+    /** Tags que falharam nesta rodada: com descoberta parcial nada é removido. */
+    const failedTags: string[] = [];
     try {
       const events = new Map<string, GammaEvent>();
       for (const tag of this.opts.tagSlugs) {
-        for (const ev of await this.fetchEvents(tag)) events.set(String(ev.id), ev);
+        try {
+          for (const ev of await this.fetchEvents(tag)) events.set(String(ev.id), ev);
+        } catch (err) {
+          failedTags.push(tag);
+          log.warn(`descoberta (${tag}) falhou`, err);
+        }
       }
 
       const games: Array<{ ev: GammaEvent; teamA: string; teamB: string; eventKey: string; game: Game; start?: number; entries: Entry[] }> = [];
@@ -434,7 +453,7 @@ export class PolymarketSource implements Source {
           entries: [{ market: m, spec: WINNER, tokenA, tokenB }, ...pickLineMarkets(ev, teamA, teamB)],
         });
       }
-      games.push(...(await this.discoverSports()));
+      games.push(...(await this.discoverSports(failedTags)));
 
       const seen = new Set<string>();
       const newTokens: string[] = [];
@@ -476,7 +495,8 @@ export class PolymarketSource implements Source {
         }
       }
 
-      for (const [marketId, t] of this.markets) {
+      // Uma tag que falhou não trouxe seus jogos: remover agora apagaria mercados ainda válidos.
+      for (const [marketId, t] of failedTags.length ? [] : this.markets) {
         if (seen.has(marketId)) continue;
         this.markets.delete(marketId);
         for (const token of [t.tokenA, t.tokenB, t.tokenDraw]) {
@@ -494,7 +514,8 @@ export class PolymarketSource implements Source {
       const winners = all.filter((t) => t.market.type === 'winner' && t.key === t.eventKey).length;
       const sports = all.filter((t) => isSport(t.game)).length;
       const sportsTxt = sports ? ` · ${sports} de esportes` : '';
-      this.detail = `${winners} jogos · ${this.markets.size - winners} handicaps/totais${sportsTxt}`;
+      const partial = failedTags.length ? ` · descoberta parcial (falhou: ${failedTags.join(', ')})` : '';
+      this.detail = `${winners} jogos · ${this.markets.size - winners} handicaps/totais${sportsTxt}${partial}`;
       log.info(`descoberta: ${events.size} eventos, ${winners} jogos + ${this.markets.size - winners} handicaps/totais (${newTokens.length} tokens novos)${sportsTxt}`);
     } catch (err) {
       this.detail = `falha na descoberta: ${(err as Error).message}`;
@@ -507,7 +528,7 @@ export class PolymarketSource implements Source {
    * futebol em três Sim/Não); handicaps/totais/ambas marcam do futebol ficam em eventos irmãos
    * com o mesmo slug + sufixo ("-more-markets").
    */
-  private async discoverSports() {
+  private async discoverSports(failedTags: string[] = []) {
     const tags = this.opts.sportTagSlugs ?? [];
     if (!tags.length) return [];
     const horizon = Date.now() + (this.opts.sportsHorizonH ?? 48) * 3_600_000;
@@ -517,6 +538,7 @@ export class PolymarketSource implements Source {
         // O end_date do evento vem bem depois do jogo (tênis: ~1 semana): o corte fino é pelo início.
         for (const ev of await this.fetchEvents(tag, new Date(horizon + 10 * 86_400_000))) events.set(String(ev.id), ev);
       } catch (err) {
+        failedTags.push(tag);
         log.warn(`descoberta de esportes (${tag}) falhou`, err);
       }
     }
