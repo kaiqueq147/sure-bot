@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import type { OddsStore } from '../core/OddsStore.js';
 import { createLogger } from '../core/logger.js';
-import { isHandicapType, isTotalType, marketLabel, sameMarket } from '../core/markets.js';
+import { isHandicapType, isOrderIndependent, isThreeWayType, marketLabel, sameMarket } from '../core/markets.js';
 import { matchQuotes, type MatchPair } from '../matching/matcher.js';
 import type { BookId, ClosedReason, Leg, Opportunity, Quote } from '../types.js';
 import { arbMargin, effectiveOdds, frozenFor, profitPct } from './math.js';
@@ -22,6 +22,15 @@ const DEFAULT_FROZEN_MS = 30_000;
 const log = createLogger('engine');
 const REOPEN_GRACE_MS = 15_000;
 
+/** Âncora do pareamento: o vencedor do jogo inteiro (`key === eventKey`). */
+export const isAnchor = (q: Quote): boolean => q.key === q.eventKey;
+
+/**
+ * Mercado de 3 vias (1X2 com empate, `result3`): duas pernas não cobrem o resultado. O tipo conta
+ * mesmo com o empate suspenso (`oddsDraw` nulo), senão o mercado viraria "2 vias" por engano.
+ */
+export const isThreeWay = (q: Quote): boolean => q.oddsDraw != null || isThreeWayType(q.market.type);
+
 /**
  * Pareia handicaps e totais a partir dos jogos já pareados pelo vencedor: mesmo tipo e mesma
  * linha. Com os times invertidos entre as casas, a linha do teamA da direita é −linha.
@@ -30,7 +39,7 @@ export function derivedPairs(winners: readonly MatchPair[], left: Quote[], right
   const byEvent = (qs: Quote[]) => {
     const m = new Map<string, Quote[]>();
     for (const q of qs) {
-      if (q.market.type === 'winner') continue;
+      if (isAnchor(q)) continue;
       if (!m.has(q.eventKey)) m.set(q.eventKey, []);
       m.get(q.eventKey)!.push(q);
     }
@@ -42,8 +51,9 @@ export function derivedPairs(winners: readonly MatchPair[], left: Quote[], right
   for (const p of winners) {
     const rs = rightBy.get(p.rightKey) ?? [];
     for (const dl of leftBy.get(p.leftKey) ?? []) {
-      // Total não depende da ordem dos times; handicap troca o lado e nega a linha; mapa só troca o lado.
-      const swapped = !isTotalType(dl.market.type) && p.swapped;
+      // Total/ambas marcam não dependem da ordem dos times; handicap troca o lado e nega a linha;
+      // mapa, empate anula e vencedor de período só trocam o lado.
+      const swapped = !isOrderIndependent(dl.market.type) && p.swapped;
       const negate = isHandicapType(dl.market.type) && swapped;
       const want = { ...dl.market, line: negate ? -dl.market.line! : dl.market.line };
       const dr = rs.find((q) => sameMarket(q.market, want));
@@ -112,7 +122,10 @@ export class ArbitrageEngine extends EventEmitter {
 
   /** Jogos pareados (só o mercado de vencedor; handicaps/totais ficam de fora da contagem). */
   get pairCount(): number {
-    return this.pairs.filter((p) => this.store.get(p.leftKey)?.market.type === 'winner').length;
+    return this.pairs.filter((p) => {
+      const q = this.store.get(p.leftKey);
+      return q !== undefined && isAnchor(q);
+    }).length;
   }
 
   /** Rematching é caro (O(n·m)); só roda quando o conjunto de mercados muda, com debounce. */
@@ -126,8 +139,8 @@ export class ArbitrageEngine extends EventEmitter {
     const left = this.store.byBook(this.left);
     const right = this.store.byBook(this.right);
     const winners = matchQuotes(
-      left.filter((q) => q.market.type === 'winner'),
-      right.filter((q) => q.market.type === 'winner'),
+      left.filter(isAnchor),
+      right.filter(isAnchor),
       { threshold: this.opts.matchThreshold, maxStartDiffMs: this.opts.maxStartDiffMs },
     );
     this.pairs = [...winners, ...derivedPairs(winners, left, right)];
@@ -177,6 +190,8 @@ export class ArbitrageEngine extends EventEmitter {
       const l = this.store.get(p.leftKey);
       const r = this.store.get(p.rightKey);
       if (!l || !r || !this.store.isFresh(l, now) || !this.store.isFresh(r, now)) continue;
+      // 1X2 continua âncora do pareamento, mas fica com o ThreeWayEngine.
+      if (isThreeWay(l) || isThreeWay(r)) continue;
 
       // Time A da casa esquerda contra o oponente na casa direita, e vice-versa.
       const combos: Array<[string, Leg, Leg]> = [
@@ -250,7 +265,7 @@ export class ArbitrageEngine extends EventEmitter {
       game: l.game,
       eventName: l.eventName,
       market: l.market,
-      marketLabel: marketLabel(l.market),
+      marketLabel: marketLabel(l.market, l.game),
       league: l.league,
       startTime: l.startTime,
       legs,

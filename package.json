@@ -12,7 +12,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "sim": "tsx src/index.ts --simulator",
-    "test": "tsx --test test/engine.test.ts test/matching.test.ts test/thunderpick.test.ts test/betby.test.ts test/value.test.ts test/markets.test.ts test/persistence.test.ts test/cloudbet.test.ts test/stake.test.ts test/netStats.test.ts test/selfArb.test.ts test/hotEvents.test.ts",
+    "test": "tsx --test test/engine.test.ts test/matching.test.ts test/thunderpick.test.ts test/betby.test.ts test/value.test.ts test/markets.test.ts test/persistence.test.ts test/cloudbet.test.ts test/stake.test.ts test/netStats.test.ts test/selfArb.test.ts test/hotEvents.test.ts test/sports.test.ts test/polymarketSports.test.ts test/result3.test.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts"
   },

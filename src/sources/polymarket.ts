@@ -1,11 +1,12 @@
 import type { OddsStore } from '../core/OddsStore.js';
 import { ReconnectingWebSocket } from '../core/ReconnectingWebSocket.js';
-import { createLogger } from '../core/logger.js';
+import { createLogger, sleep } from '../core/logger.js';
 import { Ewma } from '../core/Health.js';
-import { derivedQuoteFields, isHalfLine, isHandicapType, isMapNumber, WINNER } from '../core/markets.js';
+import { derivedQuoteFields, isHalfLine, isHandicapType, isMapNumber, marketKey, WINNER } from '../core/markets.js';
 import { depthOdds } from '../engine/math.js';
 import { detectGame } from '../matching/normalize.js';
 import { NetStats } from './netStats.js';
+import { hasDraw, isSport } from '../core/sports.js';
 import type { DepthLevel, Game, MarketSpec, Quote, Source, SourceStatus } from '../types.js';
 
 interface GammaMarket {
@@ -31,7 +32,7 @@ interface GammaMarket {
   feeSchedule?: { rate?: number; takerOnly?: boolean };
 }
 
-interface GammaEvent {
+export interface GammaEvent {
   id: string | number;
   slug: string;
   title: string;
@@ -52,6 +53,8 @@ interface TrackedMarket {
   /** tokenA = seleção A do quote (teamA, teamA com a linha, ou "mais de") */
   tokenA: string;
   tokenB: string;
+  /** Só no 1X2 do futebol: o "Sim" do mercado de empate */
+  tokenDraw?: string;
   eventName: string;
   teamA: string;
   teamB: string;
@@ -79,6 +82,9 @@ export interface PolymarketOptions {
   discoveryIntervalMs: number;
   minFillUsd: number;
   depthLevels: number;
+  /** Tags com jogos de esportes tradicionais; vazio desliga */
+  sportTagSlugs?: string[];
+  sportsHorizonH?: number;
 }
 
 const log = createLogger('polymarket');
@@ -197,11 +203,139 @@ export function pickLineMarkets(
   return out;
 }
 
+/** Tags do Gamma -> esporte tradicional. Um evento de NBA traz "nba" e "basketball". */
+const SPORT_TAGS: Array<[Game, string[]]> = [
+  ['soccer', ['soccer']],
+  ['basketball', ['basketball', 'nba', 'wnba', 'ncaab']],
+  ['baseball', ['baseball', 'mlb', 'kbo', 'npb']],
+  ['tennis', ['tennis', 'atp', 'wta']],
+  ['american_football', ['nfl', 'ncaaf', 'american-football']],
+];
+
+export function sportOf(ev: GammaEvent): Game | null {
+  const tags = new Set((ev.tags ?? []).map((t) => (t.slug ?? '').toLowerCase()));
+  return SPORT_TAGS.find(([, slugs]) => slugs.some((s) => tags.has(s)))?.[0] ?? null;
+}
+
+type Period = NonNullable<MarketSpec['period']>;
+
+/** sportsMarketType -> mercado do contrato (só 2 vias; o resto fica de fora). */
+const SPORT_LINE_TYPES: Record<string, { type: MarketSpec['type']; period?: Period; sel: 'teams' | 'ou' | 'yesno' }> = {
+  spreads: { type: 'handicap', sel: 'teams' },
+  totals: { type: 'total', sel: 'ou' },
+  first_half_spreads: { type: 'handicap', period: 'h1', sel: 'teams' },
+  first_half_totals: { type: 'total', period: 'h1', sel: 'ou' },
+  both_teams_to_score: { type: 'btts', sel: 'yesno' },
+  both_teams_to_score_first_half: { type: 'btts', period: 'h1', sel: 'yesno' },
+  // Tênis: total de games da partida e do 1º set, vencedor do 1º set (o handicap da Polymarket é de sets)
+  tennis_match_totals: { type: 'total', sel: 'ou' },
+  tennis_first_set_totals: { type: 'total', period: 'set1', sel: 'ou' },
+  tennis_first_set_winner: { type: 'winner', period: 'set1', sel: 'teams' },
+};
+
+const tradable = (m: GammaMarket) =>
+  !(m.closed || m.archived || m.active === false || m.enableOrderBook === false || m.acceptingOrders === false);
+
+type Entry = { market: GammaMarket; spec: MarketSpec; tokenA: string; tokenB: string; tokenDraw?: string };
+
+/**
+ * Mercados de linha de um jogo de esporte tradicional, nos eventos do jogo (o principal e os
+ * "- More Markets" do futebol). Handicap: a linha vale para o primeiro outcome.
+ */
+export function pickSportLineMarkets(events: GammaEvent[], teamA: string, teamB: string): Entry[] {
+  const out: Entry[] = [];
+  for (const m of events.flatMap((e) => e.markets ?? [])) {
+    const kind = SPORT_LINE_TYPES[m.sportsMarketType ?? ''];
+    if (!kind || !tradable(m)) continue;
+    const outcomes = parseList(m.outcomes).map(norm);
+    const tokens = parseList(m.clobTokenIds);
+    if (outcomes.length !== 2 || tokens.length !== 2) continue;
+    const [o0, o1] = outcomes;
+    const spec = (line?: number): MarketSpec => ({
+      type: kind.type,
+      ...(line !== undefined ? { line } : {}),
+      ...(kind.period ? { period: kind.period } : {}),
+    });
+    const straight = o0 === norm(teamA) && o1 === norm(teamB);
+    const crossed = o0 === norm(teamB) && o1 === norm(teamA);
+    if (kind.sel === 'yesno') {
+      if (o0 === 'yes' && o1 === 'no') out.push({ market: m, spec: spec(), tokenA: tokens[0], tokenB: tokens[1] });
+      else if (o0 === 'no' && o1 === 'yes') out.push({ market: m, spec: spec(), tokenA: tokens[1], tokenB: tokens[0] });
+      continue;
+    }
+    if (kind.sel === 'teams' && kind.type !== 'handicap') {
+      if (straight) out.push({ market: m, spec: spec(), tokenA: tokens[0], tokenB: tokens[1] });
+      else if (crossed) out.push({ market: m, spec: spec(), tokenA: tokens[1], tokenB: tokens[0] });
+      continue;
+    }
+    const line = Number(m.line);
+    if (!isHalfLine(line)) continue;
+    if (kind.sel === 'teams') {
+      if (straight) out.push({ market: m, spec: spec(line), tokenA: tokens[0], tokenB: tokens[1] });
+      else if (crossed) out.push({ market: m, spec: spec(-line), tokenA: tokens[1], tokenB: tokens[0] });
+    } else if (o0.startsWith('over') && o1.startsWith('under')) {
+      out.push({ market: m, spec: spec(line), tokenA: tokens[0], tokenB: tokens[1] });
+    } else if (o0.startsWith('under') && o1.startsWith('over')) {
+      out.push({ market: m, spec: spec(line), tokenA: tokens[1], tokenB: tokens[0] });
+    }
+  }
+  return out;
+}
+
+/**
+ * 1X2 do futebol: a Polymarket publica três mercados Sim/Não ("X vence?", "empate?", "Y vence?").
+ * Apostar numa seleção = comprar o "Sim" dela, então A/empate/B são os tokens "Sim" de cada um.
+ * Mandante = primeiro nome do título ("Villarreal CF vs. RCD Espanyol de Barcelona").
+ */
+export function pickSoccer1x2(ev: GammaEvent): { teamA: string; teamB: string; entry: Entry } | null {
+  const [home, away] = ev.title.split(/\s+vs\.?\s+/i).map((t) => t.trim());
+  if (!home || !away) return null;
+  const entry = pickThreeWay(ev.markets ?? [], 'moneyline', home, away, WINNER);
+  return entry ? { teamA: home, teamB: away, entry } : null;
+}
+
+/**
+ * Resultado no intervalo (1X2 do 1º tempo): mesmo formato do 1X2, no evento irmão
+ * "<jogo> - Halftime Result" ("X leading at halftime?", "Draw at halftime?"). Vira `result3`.
+ */
+export function pickHalftime1x2(events: GammaEvent[], home: string, away: string): Entry | null {
+  const markets = events.flatMap((e) => e.markets ?? []);
+  return pickThreeWay(markets, 'soccer_halftime_result', home, away, { type: 'result3', period: 'h1' });
+}
+
+/** Três mercados Sim/Não (casa, empate, fora) de um `sportsMarketType`: os tokens "Sim" de cada. */
+function pickThreeWay(markets: GammaMarket[], type: string, home: string, away: string, spec: MarketSpec): Entry | null {
+  const yes = (m: GammaMarket) => {
+    const outcomes = parseList(m.outcomes).map(norm);
+    const tokens = parseList(m.clobTokenIds);
+    const i = outcomes.indexOf('yes');
+    return outcomes.length === 2 && tokens.length === 2 && i >= 0 ? tokens[i] : undefined;
+  };
+  const ms = markets.filter((m) => m.sportsMarketType === type && tradable(m));
+  if (ms.length !== 3) return null;
+  const draw = ms.find((m) => /^draw\b/i.test(m.groupItemTitle ?? '') || /\bdraw\b/i.test(m.question ?? ''));
+  const team = (name: string) => ms.find((m) => m !== draw && norm(m.groupItemTitle ?? '') === norm(name));
+  const mh = team(home);
+  const ma = team(away);
+  if (!draw || !mh || !ma) return null;
+  const [tokenA, tokenB, tokenDraw] = [yes(mh), yes(ma), yes(draw)];
+  if (!tokenA || !tokenB || !tokenDraw) return null;
+  return { market: mh, spec, tokenA, tokenB, tokenDraw };
+}
+
+/** Mesmo critério de `stake.ts`: tipo/período que `markets.ts` ainda não distingue fica de fora. */
+function marketKeySupported(spec: MarketSpec): boolean {
+  const k = marketKey(spec);
+  if (spec.type !== 'winner' && k === 'win') return false;
+  if (spec.period && !k.includes(spec.period)) return false;
+  return true;
+}
+
 export class PolymarketSource implements Source {
   readonly name = 'polymarket';
   private readonly ws: ReconnectingWebSocket;
   private readonly markets = new Map<string, TrackedMarket>();
-  private readonly tokenIndex = new Map<string, { marketId: string; side: 'A' | 'B' }>();
+  private readonly tokenIndex = new Map<string, { marketId: string; side: 'A' | 'B' | 'D' }>();
   private readonly books = new Map<string, Book>();
   private discoveryTimer?: NodeJS.Timeout;
   private lastMessageAt?: number;
@@ -253,7 +387,7 @@ export class PolymarketSource implements Source {
 
   // ---------------------------------------------------------------- descoberta
 
-  private async fetchEvents(tag: string): Promise<GammaEvent[]> {
+  private async fetchEvents(tag: string, endMax?: Date): Promise<GammaEvent[]> {
     const all: GammaEvent[] = [];
     for (let offset = 0; offset < 2_000; offset += PAGE) {
       const url = new URL('/events', this.opts.gammaUrl);
@@ -262,72 +396,111 @@ export class PolymarketSource implements Source {
       url.searchParams.set('closed', 'false');
       // Eventos já jogados continuam "active" até a resolução, com book vazio.
       url.searchParams.set('end_date_min', new Date().toISOString());
+      // Esportes tradicionais: corta futuros (campeão da temporada etc.) e jogos distantes.
+      if (endMax) url.searchParams.set('end_date_max', endMax.toISOString());
       url.searchParams.set('limit', String(PAGE));
       url.searchParams.set('offset', String(offset));
-      const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-      this.net.record(res.status);
-      if (!res.ok) throw new Error(`Gamma ${res.status} ${res.statusText}`);
-      const page = (await res.json()) as GammaEvent[];
+      const page = await this.fetchPage(url);
       all.push(...page);
       if (page.length < PAGE) break;
     }
     return all;
   }
 
+  /** Uma página do Gamma: até 3 tentativas, 30s cada (páginas de esportes passam de 1 MB). */
+  private async fetchPage(url: URL): Promise<GammaEvent[]> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(30_000) });
+        this.net.record(res.status);
+        if (!res.ok) throw new Error(`Gamma ${res.status} ${res.statusText}`);
+        return (await res.json()) as GammaEvent[];
+      } catch (err) {
+        if (attempt >= 3) throw err;
+        await sleep(1_000 * attempt);
+      }
+    }
+  }
+
   private async discover(): Promise<void> {
+    /** Tags que falharam nesta rodada: com descoberta parcial nada é removido. */
+    const failedTags: string[] = [];
     try {
       const events = new Map<string, GammaEvent>();
       for (const tag of this.opts.tagSlugs) {
-        for (const ev of await this.fetchEvents(tag)) events.set(String(ev.id), ev);
+        try {
+          for (const ev of await this.fetchEvents(tag)) events.set(String(ev.id), ev);
+        } catch (err) {
+          failedTags.push(tag);
+          log.warn(`descoberta (${tag}) falhou`, err);
+        }
       }
 
-      const seen = new Set<string>();
-      const newTokens: string[] = [];
+      const games: Array<{ ev: GammaEvent; teamA: string; teamB: string; eventKey: string; game: Game; start?: number; entries: Entry[] }> = [];
       for (const ev of events.values()) {
         if (ev.closed) continue;
         const m = pickMatchWinner(ev);
         if (!m) continue;
-        const winnerId = String(m.id);
         const [teamA, teamB] = parseList(m.outcomes);
         const [tokenA, tokenB] = parseList(m.clobTokenIds);
-        const eventKey = `polymarket:${winnerId}`;
+        games.push({
+          ev,
+          teamA,
+          teamB,
+          eventKey: `polymarket:${m.id}`,
+          game: detectGame(...(ev.tags ?? []).flatMap((t) => [t.slug, t.label]), ev.title),
+          start: toEpoch(m.eventStartTime) ?? toEpoch(m.gameStartTime) ?? toEpoch(ev.startTime),
+          entries: [{ market: m, spec: WINNER, tokenA, tokenB }, ...pickLineMarkets(ev, teamA, teamB)],
+        });
+      }
+      games.push(...(await this.discoverSports(failedTags)));
+
+      const seen = new Set<string>();
+      const newTokens: string[] = [];
+      for (const { ev, teamA, teamB, eventKey, game, start, entries } of games) {
         const base = {
           teamA,
           teamB,
           eventName: ev.title,
-          game: detectGame(...(ev.tags ?? []).flatMap((t) => [t.slug, t.label]), ev.title),
+          game,
           league: ev.series?.[0]?.title,
-          startTime: toEpoch(m.eventStartTime) ?? toEpoch(m.gameStartTime) ?? toEpoch(ev.startTime),
+          startTime: start,
           url: `https://polymarket.com/event/${ev.slug}`,
         };
-        const entries = [
-          { market: m, spec: WINNER, tokenA, tokenB },
-          ...pickLineMarkets(ev, teamA, teamB),
-        ];
         for (const e of entries) {
-          const marketId = String(e.market.id);
+          // O 1X2 junta três mercados: a chave é o evento, não um mercado. O `result3` (intervalo)
+          // usa o id do mercado do mandante, que é único.
+          const marketId = e.tokenDraw && e.spec.type === 'winner' ? `1x2:${ev.id}` : String(e.market.id);
+          if (seen.has(marketId)) continue;
           seen.add(marketId);
           if (this.markets.has(marketId)) continue;
           const tracked: TrackedMarket = {
             ...base,
-            ...derivedQuoteFields(eventKey, e.spec, teamA, teamB),
+            ...derivedQuoteFields(eventKey, e.spec, teamA, teamB, game),
             marketId,
             tokenA: e.tokenA,
             tokenB: e.tokenB,
+            tokenDraw: e.tokenDraw,
             takerFeeRate: e.market.feesEnabled === false ? 0 : (e.market.feeSchedule?.rate ?? 0),
           };
           this.markets.set(marketId, tracked);
           this.tokenIndex.set(e.tokenA, { marketId, side: 'A' });
           this.tokenIndex.set(e.tokenB, { marketId, side: 'B' });
           newTokens.push(e.tokenA, e.tokenB);
+          if (e.tokenDraw) {
+            this.tokenIndex.set(e.tokenDraw, { marketId, side: 'D' });
+            newTokens.push(e.tokenDraw);
+          }
           this.store.upsert(this.toQuote(tracked, null, null));
         }
       }
 
-      for (const [marketId, t] of this.markets) {
+      // Uma tag que falhou não trouxe seus jogos: remover agora apagaria mercados ainda válidos.
+      for (const [marketId, t] of failedTags.length ? [] : this.markets) {
         if (seen.has(marketId)) continue;
         this.markets.delete(marketId);
-        for (const token of [t.tokenA, t.tokenB]) {
+        for (const token of [t.tokenA, t.tokenB, t.tokenDraw]) {
+          if (!token) continue;
           this.tokenIndex.delete(token);
           this.books.delete(token);
         }
@@ -337,13 +510,70 @@ export class PolymarketSource implements Source {
       if (newTokens.length && this.ws.isOpen) {
         for (const chunk of chunks(newTokens)) this.ws.send({ assets_ids: chunk, operation: 'subscribe' });
       }
-      const winners = [...this.markets.values()].filter((t) => t.market.type === 'winner').length;
-      this.detail = `${winners} jogos · ${this.markets.size - winners} handicaps/totais`;
-      log.info(`descoberta: ${events.size} eventos, ${winners} jogos + ${this.markets.size - winners} handicaps/totais (${newTokens.length / 2} mercados novos)`);
+      const all = [...this.markets.values()];
+      const winners = all.filter((t) => t.market.type === 'winner' && t.key === t.eventKey).length;
+      const sports = all.filter((t) => isSport(t.game)).length;
+      const sportsTxt = sports ? ` · ${sports} de esportes` : '';
+      const partial = failedTags.length ? ` · descoberta parcial (falhou: ${failedTags.join(', ')})` : '';
+      this.detail = `${winners} jogos · ${this.markets.size - winners} handicaps/totais${sportsTxt}${partial}`;
+      log.info(`descoberta: ${events.size} eventos, ${winners} jogos + ${this.markets.size - winners} handicaps/totais (${newTokens.length} tokens novos)${sportsTxt}`);
     } catch (err) {
       this.detail = `falha na descoberta: ${(err as Error).message}`;
       log.error('falha na descoberta de mercados', err);
     }
+  }
+
+  /**
+   * Jogos de esportes tradicionais: o evento principal tem o vencedor (2 vias, ou o 1X2 do
+   * futebol em três Sim/Não); handicaps/totais/ambas marcam do futebol ficam em eventos irmãos
+   * com o mesmo slug + sufixo ("-more-markets").
+   */
+  private async discoverSports(failedTags: string[] = []) {
+    const tags = this.opts.sportTagSlugs ?? [];
+    if (!tags.length) return [];
+    const horizon = Date.now() + (this.opts.sportsHorizonH ?? 48) * 3_600_000;
+    const events = new Map<string, GammaEvent>();
+    for (const tag of tags) {
+      try {
+        // O end_date do evento vem bem depois do jogo (tênis: ~1 semana): o corte fino é pelo início.
+        for (const ev of await this.fetchEvents(tag, new Date(horizon + 10 * 86_400_000))) events.set(String(ev.id), ev);
+      } catch (err) {
+        failedTags.push(tag);
+        log.warn(`descoberta de esportes (${tag}) falhou`, err);
+      }
+    }
+    const bySlug = [...events.values()];
+    const out: Array<{ ev: GammaEvent; teamA: string; teamB: string; eventKey: string; game: Game; start?: number; entries: Entry[] }> = [];
+    for (const ev of events.values()) {
+      const game = sportOf(ev);
+      if (!game || ev.closed || !/\svs\.?\s/i.test(ev.title)) continue;
+      const siblings = bySlug.filter((e) => e !== ev && e.slug.startsWith(`${ev.slug}-`));
+      let teamA: string;
+      let teamB: string;
+      let winner: Entry;
+      if (hasDraw(game)) {
+        const x = pickSoccer1x2(ev);
+        if (!x) continue;
+        ({ teamA, teamB } = x);
+        winner = x.entry;
+      } else {
+        const m = pickMatchWinner(ev);
+        if (!m || m.sportsMarketType !== 'moneyline') continue;
+        [teamA, teamB] = parseList(m.outcomes);
+        const [tokenA, tokenB] = parseList(m.clobTokenIds);
+        winner = { market: m, spec: WINNER, tokenA, tokenB };
+      }
+      // Início do jogo: o do evento é o do torneio no tênis.
+      const start = toEpoch(winner.market.gameStartTime) ?? toEpoch(winner.market.eventStartTime) ?? toEpoch(ev.startTime);
+      if (start !== undefined && start > horizon) continue;
+      const lines = pickSportLineMarkets([ev, ...siblings], teamA, teamB).filter((e) => marketKeySupported(e.spec));
+      if (hasDraw(game)) {
+        const ht = pickHalftime1x2([ev, ...siblings], teamA, teamB);
+        if (ht && marketKeySupported(ht.spec)) lines.push(ht);
+      }
+      out.push({ ev, teamA, teamB, eventKey: `polymarket:${winner.tokenDraw ? `1x2:${ev.id}` : winner.market.id}`, game, start, entries: [winner, ...lines] });
+    }
+    return out;
   }
 
   // ---------------------------------------------------------------- websocket
@@ -438,11 +668,14 @@ export class PolymarketSource implements Source {
   private refreshQuote(marketId: string): void {
     const t = this.markets.get(marketId);
     if (!t) return;
-    this.store.upsert(this.toQuote(t, this.side(t.tokenA), this.side(t.tokenB)));
+    const d = t.tokenDraw ? this.side(t.tokenDraw) : null;
+    this.store.upsert(this.toQuote(t, this.side(t.tokenA), this.side(t.tokenB), d));
   }
 
-  private toQuote(t: TrackedMarket, a: SideBook | null, b: SideBook | null): Quote {
+  private toQuote(t: TrackedMarket, a: SideBook | null, b: SideBook | null, d: SideBook | null = null): Quote {
     return {
+      // 1X2: presença de `oddsDraw` (mesmo null) marca o mercado como 3 vias.
+      ...(t.tokenDraw ? { oddsDraw: d?.odds ?? null, maxStakeDraw: d?.liquidity } : {}),
       key: t.key,
       eventKey: t.eventKey,
       market: t.market,

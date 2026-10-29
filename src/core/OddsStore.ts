@@ -75,7 +75,7 @@ export class OddsStore extends EventEmitter {
   isFresh(q: Quote, now = Date.now()): boolean {
     if (this.unavailable.has(q.book) || q.suspended) return false;
     if (!q.oddsA || !q.oddsB || q.oddsA <= 1 || q.oddsB <= 1) return false;
-    const ttl = this.ttl.get(q.book);
+    const ttl = q.ttlMs ?? this.ttl.get(q.book);
     return ttl === undefined || now - q.updatedAt <= ttl;
   }
 }

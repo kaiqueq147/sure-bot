@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildStakeQuery, stakeMarkets, type StakeFixture, type StakeMarket } from '../src/sources/stake.js';
+import { buildStakeQuery, buildStakeSportsQuery, stakeMarkets, stakeSportMarkets, type StakeFixture, type StakeMarket } from '../src/sources/stake.js';
 
 const out = (name: string, odds: number, active = true) => ({ name, odds, active });
 const mkt = (specifiers: string, outcomes: ReturnType<typeof out>[], status = 'active'): StakeMarket => ({ id: specifiers, status, specifiers, outcomes });
@@ -84,4 +84,70 @@ test('query só ao vivo omite o pré-jogo', () => {
   const q = buildStakeQuery(['counter-strike', 'dota-2'], false);
   assert.equal(q.match(/fixtureList\(type: live/g)?.length, 2);
   assert.doesNotMatch(q, /upcoming/);
+});
+
+const smkt = (id: string, specifiers: string, outcomes: Array<[string, number]>, status = 'active'): StakeMarket => ({
+  id,
+  status,
+  specifiers,
+  outcomes: outcomes.map(([name, odds]) => ({ name, odds, active: true })),
+});
+const sportFx = (templates: Array<{ extId: string; markets: StakeMarket[] }>): StakeFixture => ({
+  id: 'f1',
+  slug: 'home-away',
+  status: 'active',
+  data: { startTime: '2026-10-30T20:00:00Z', competitors: [{ name: 'Home FC' }, { name: 'Away FC' }] },
+  main: [{ name: 'main', templates }],
+});
+
+test('futebol: 1X2 com empate, DNB, ambas marcam e linhas x.5', () => {
+  const fx = sportFx([
+    { extId: '1', markets: [smkt('m1', '', [['Away FC', 3.1], ['Draw', 3.4], ['Home FC', 2.2]])] },
+    { extId: '11', markets: [smkt('m2', '', [['Home FC', 1.6], ['Away FC', 2.3]])] },
+    { extId: '29', markets: [smkt('m3', '', [['No', 1.9], ['Yes', 1.85]])] },
+    { extId: '16', markets: [smkt('m4', 'hcp=-0.5', [['Home FC (-0.5)', 2.2], ['Away FC (0.5)', 1.7]]), smkt('m5', 'hcp=-0.25', [['Home FC (-0.25)', 2], ['Away FC (0.25)', 1.8]])] },
+    { extId: '18', markets: [smkt('m6', 'total=2.5', [['Over 2.5', 1.9], ['Under 2.5', 1.9]]), smkt('m7', 'total=2', [['Over 2', 1.6], ['Under 2', 2.2]])] },
+  ]);
+  const ms = stakeSportMarkets('soccer', fx);
+  const winner = ms.find((m) => m.spec.type === 'winner')!;
+  assert.deepEqual([winner.a, winner.draw, winner.b], [2.2, 3.4, 3.1], 'casa/empate/fora pelo nome, não pela ordem');
+  assert.deepEqual(ms.find((m) => m.spec.type === 'btts') && [ms.find((m) => m.spec.type === 'btts')!.a, ms.find((m) => m.spec.type === 'btts')!.b], [1.85, 1.9]);
+  assert.ok(ms.some((m) => m.spec.type === 'dnb' && m.a === 1.6));
+  assert.deepEqual(ms.filter((m) => m.spec.type === 'handicap').map((m) => m.spec.line), [-0.5], 'linha de quarto (−0.25) fica de fora');
+  assert.deepEqual(ms.filter((m) => m.spec.type === 'total').map((m) => m.spec.line), [2.5], 'linha inteira fica de fora');
+});
+
+test('basquete: período do 1º quarto só com quarternr=1; tênis: games e 1º set', () => {
+  const bb = stakeSportMarkets('basketball', sportFx([
+    { extId: '219', markets: [smkt('w', '', [['Home FC', 1.5], ['Away FC', 2.6]])] },
+    { extId: '303', markets: [smkt('q1', 'quarternr=1|hcp=-1.5', [['Home FC (-1.5)', 1.9], ['Away FC (1.5)', 1.9]]), smkt('q2', 'quarternr=2|hcp=-1.5', [['Home FC (-1.5)', 1.9], ['Away FC (1.5)', 1.9]])] },
+  ]));
+  assert.deepEqual(bb.map((m) => `${m.spec.type}${m.spec.period ? '@' + m.spec.period : ''}`), ['winner', 'handicap@q1']);
+  assert.equal(bb[0].draw, undefined, 'basquete não tem empate');
+  const tn = stakeSportMarkets('tennis', sportFx([
+    { extId: '188', markets: [smkt('s', 'hcp=-1.5', [['Home FC (-1.5)', 2], ['Away FC (1.5)', 1.8]])] },
+    { extId: '204', markets: [smkt('t', 'setnr=1|total=9.5', [['Over 9.5', 1.9], ['Under 9.5', 1.9]])] },
+  ]));
+  assert.deepEqual(tn.map((m) => `${m.spec.type}@${m.spec.period}:${m.spec.line}`), ['total@set1:9.5'], 'handicap de sets (188) não entra');
+});
+
+test('query de esportes: alias por esporte, limite 50 e offset', () => {
+  const q = buildStakeSportsQuery(['soccer', 'basketball'], 'upcoming', 50);
+  assert.match(q, /t0: slugSport\(sport: "soccer"\)/);
+  assert.match(q, /t1: slugSport\(sport: "basketball"\)/);
+  assert.equal(q.match(/limit: 50, offset: 50/g)?.length, 2);
+  assert.match(q, /groups\(groups: \["main","half"\]/);
+  assert.match(q, /^query StakeSports/);
+});
+
+test('3 vias: NFL no tempo regulamentar, 1º tempo e 1º quarto viram result3', () => {
+  const fx = sportFx([
+    { extId: '1', markets: [smkt('r', '', [['Away FC', 2.2], ['Draw', 30], ['Home FC', 1.7]])] },
+    { extId: '60', markets: [smkt('h', '', [['Home FC', 2.0], ['Draw', 6.5], ['Away FC', 2.3]])] },
+    { extId: '235', markets: [smkt('q1', 'quarternr=1', [['Home FC', 2.1], ['Draw', 7], ['Away FC', 2.2]]), smkt('q2', 'quarternr=2', [['Home FC', 2], ['Draw', 7], ['Away FC', 2]])] },
+  ]);
+  const r3 = stakeSportMarkets('american-football', fx).filter((m) => m.spec.type === 'result3');
+  assert.deepEqual(r3.map((m) => m.spec.period ?? 'ft'), ['ft', 'h1', 'q1'], 'só o 1º quarto do 235');
+  const reg = r3[0];
+  assert.deepEqual([reg.a, reg.draw, reg.b], [1.7, 30, 2.2], 'casa/fora pelo nome, não pela posição');
 });

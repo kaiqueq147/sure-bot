@@ -21,6 +21,18 @@ const MIME: Record<string, string> = {
   '.json': 'application/json',
 };
 
+/** Estado de cada cliente do WebSocket. */
+export interface ClientState {
+  /**
+   * Chaves de quote que o painel tem na tela (mensagem `watch`). As idades das odds vão só
+   * para essas chaves; `null` = cliente antigo que nunca mandou `watch` (recebe tudo).
+   */
+  watch: Set<string> | null;
+}
+
+/** Teto de chaves por `watch`: o painel só renderiza algumas dezenas de cards por aba. */
+const MAX_WATCH_KEYS = 3_000;
+
 export interface ServerOptions {
   port: number;
   /** Interface de escuta. 0.0.0.0 para o processo aceitar tráfego de fora do container. */
@@ -81,9 +93,24 @@ export function startServer(opts: ServerOptions) {
   const wss = new WebSocketServer({ server: http, path: '/ws' });
   const alive = new WeakSet<WebSocket>();
 
+  const clients = new Map<WebSocket, ClientState>();
+
   wss.on('connection', (ws) => {
     alive.add(ws);
+    clients.set(ws, { watch: null });
     ws.on('pong', () => alive.add(ws));
+    ws.on('close', () => clients.delete(ws));
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(String(raw)) as { type?: string; keys?: unknown };
+        if (msg.type === 'watch' && Array.isArray(msg.keys)) {
+          const keys = msg.keys.filter((k): k is string => typeof k === 'string').slice(0, MAX_WATCH_KEYS);
+          clients.get(ws)!.watch = new Set(keys);
+        }
+      } catch {
+        // mensagem malformada: ignora
+      }
+    });
     ws.send(JSON.stringify(opts.snapshot()));
   });
 
@@ -119,6 +146,10 @@ export function startServer(opts: ServerOptions) {
     broadcast(msg: unknown) {
       const data = JSON.stringify(msg);
       for (const ws of wss.clients) if (ws.readyState === WebSocket.OPEN) ws.send(data);
+    },
+    /** Mensagem montada por cliente (ex.: idades só das chaves que ele está vendo). */
+    broadcastEach(build: (client: ClientState) => unknown) {
+      for (const [ws, client] of clients) if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(build(client)));
     },
     async close() {
       clearInterval(heartbeat);

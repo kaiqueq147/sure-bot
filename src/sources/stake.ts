@@ -11,11 +11,13 @@ import {
   isHalfLine,
   isMapNumber,
   isHandicapType,
+  marketKey,
   WINNER,
 } from "../core/markets.js";
 import type {
   Game,
   MarketSpec,
+  MarketType,
   Quote,
   Source,
   SourceStatus,
@@ -90,6 +92,16 @@ export interface StakeOptions {
   usePlaywright: boolean;
   /** Usa node-curl-impersonate (TLS fingerprint de Chrome) */
   useTlsClient: boolean;
+  /** Esportes tradicionais (slugs da Stake); vazio desliga. Ciclo próprio, só com o cliente TLS. */
+  tradSports?: string[];
+  /** Cadência do ao vivo dos esportes tradicionais */
+  tradLiveIntervalMs?: number;
+  /** Cadência do pré-jogo dos esportes tradicionais (paginado, o payload pesa) */
+  tradPrematchIntervalMs?: number;
+  /** Máximo de jogos de pré-jogo por esporte */
+  tradPrematchMax?: number;
+  /** Só pré-jogo que começa dentro desta janela (horas) */
+  tradHorizonH?: number;
 }
 
 export const STAKE_SPORTS: Record<string, Game> = {
@@ -107,6 +119,29 @@ export const STAKE_SPORTS: Record<string, Game> = {
   "arena-of-valor": "aov",
   "mobile-legends": "mlbb",
 };
+
+/** Slug da Stake -> esporte tradicional (aba "Esportes"). */
+export const STAKE_TRAD_SPORTS: Record<string, Game> = {
+  soccer: "soccer",
+  basketball: "basketball",
+  baseball: "baseball",
+  tennis: "tennis",
+  "american-football": "american_football",
+};
+
+/**
+ * Grupos pedidos por esporte. Cada grupo traz templates inteiros (placar exato, combos...), então
+ * só os que têm mercados usados: 40 jogos de futebol com "main" ~133 KB; com "goals" ~238 KB.
+ */
+const TRAD_GROUPS: Record<string, string[]> = {
+  soccer: ["main"],
+  basketball: ["main", "half"],
+  "american-football": ["main", "half"],
+  tennis: ["main"],
+  baseball: ["main"],
+};
+/** A API recusa `limit` acima de 50 (numberLessEqual). */
+const TRAD_PAGE = 50;
 
 const FIXTURE_LIMIT = 50;
 /** Quanto tempo reutilizar o IP resolvido antes de consultar o DNS de novo. */
@@ -164,6 +199,159 @@ export function buildHotQuery(fixtureIds: string[]): string {
     .map((id, i) => `h${i}: sportFixture(fixtureId: ${JSON.stringify(id)}) { ${FIXTURE_FIELDS} }`)
     .join("\n");
   return `query StakeHot {\n${body}\n}`;
+}
+
+/**
+ * Esportes tradicionais: um alias por esporte (`t0`, `t1`, ...) com os grupos de TRAD_GROUPS.
+ * Os grupos ficam no alias `main` para reaproveitar `StakeFixture`.
+ */
+export function buildStakeSportsQuery(sports: string[], type: "live" | "upcoming", offset = 0): string {
+  const body = sports
+    .map((s, i) => {
+      const groups = JSON.stringify(TRAD_GROUPS[s] ?? ["main"]);
+      return `t${i}: slugSport(sport: ${JSON.stringify(s)}) { slug list: fixtureList(type: ${type}, limit: ${TRAD_PAGE}, offset: ${offset}) {
+  id slug status
+  data { ... on SportFixtureDataMatch { startTime competitors { name } } }
+  tournament { name slug category { slug } }
+  main: groups(groups: ${groups}, status: [active, suspended, deactivated]) { name templates(includeEmpty: false) { extId ${MARKETS} } }
+} }`;
+    })
+    .join("\n");
+  return `query StakeSports {\n${body}\n}`;
+}
+
+type Period = NonNullable<MarketSpec["period"]>;
+/** teams = casa/fora; ou = mais/menos; yesno = sim/não; three = casa/empate/fora (`result3`) */
+interface TradTemplate {
+  type: MarketType;
+  sel: "teams" | "ou" | "yesno" | "three";
+  period?: Period;
+  /** specifier exigido (ex.: só o 1º quarto) */
+  only?: [string, string];
+}
+
+/** IDs Sportradar (`extId`) usados por esporte; o mesmo id muda de sentido entre esportes. */
+const TRAD_TEMPLATES: Record<string, Record<string, TradTemplate>> = {
+  soccer: {
+    "11": { type: "dnb", sel: "teams" },
+    "29": { type: "btts", sel: "yesno" },
+    "75": { type: "btts", sel: "yesno", period: "h1" },
+    "16": { type: "handicap", sel: "teams" },
+    "18": { type: "total", sel: "ou" },
+    "66": { type: "handicap", sel: "teams", period: "h1" },
+    "68": { type: "total", sel: "ou", period: "h1" },
+  },
+  basketball: {
+    "219": { type: "winner", sel: "teams" },
+    "223": { type: "handicap", sel: "teams" },
+    "225": { type: "total", sel: "ou" },
+    "66": { type: "handicap", sel: "teams", period: "h1" },
+    "68": { type: "total", sel: "ou", period: "h1" },
+    "303": { type: "handicap", sel: "teams", period: "q1", only: ["quarternr", "1"] },
+    "236": { type: "total", sel: "ou", period: "q1", only: ["quarternr", "1"] },
+    // 3 vias (empate possível): tempo regulamentar, 1º tempo e 1º quarto
+    "1": { type: "result3", sel: "three" },
+    "60": { type: "result3", sel: "three", period: "h1" },
+    "235": { type: "result3", sel: "three", period: "q1", only: ["quarternr", "1"] },
+  },
+  baseball: {
+    "251": { type: "winner", sel: "teams" },
+    "256": { type: "handicap", sel: "teams" },
+    "258": { type: "total", sel: "ou" },
+    "1124": { type: "winner", sel: "teams", period: "i5" },
+  },
+  tennis: {
+    "186": { type: "winner", sel: "teams" },
+    // Handicap e total de games (o 188 é handicap de sets: não entra)
+    "187": { type: "handicap", sel: "teams" },
+    "189": { type: "total", sel: "ou" },
+    "202": { type: "winner", sel: "teams", period: "set1", only: ["setnr", "1"] },
+    "203": { type: "handicap", sel: "teams", period: "set1", only: ["setnr", "1"] },
+    "204": { type: "total", sel: "ou", period: "set1", only: ["setnr", "1"] },
+  },
+};
+TRAD_TEMPLATES["american-football"] = TRAD_TEMPLATES.basketball;
+
+type SportOdds = TwoWayOdds & { spec: MarketSpec; draw?: number | null };
+
+/** 1X2: casa/fora pelo nome (não pela posição) e o empate ("Draw"); suspenso se faltar preço. */
+function threeWayOdds(m: StakeMarket, home: string, away: string): (TwoWayOdds & { draw: number | null }) | null {
+  const draw = m.outcomes.find((o) => /^draw$/i.test(o.name.trim()));
+  const teams = m.outcomes.filter((o) => o !== draw);
+  if (!draw || teams.length !== 2) return null;
+  const odds = pairOdds(m, ...homeAway({ ...m, outcomes: teams }, home, away));
+  if (!odds) return null;
+  const d = m.status === "active" && Number.isFinite(draw.odds) && draw.odds > 1 ? draw.odds : null;
+  return { ...odds, suspended: odds.suspended || !draw.active || d === null, draw: d };
+}
+
+/**
+ * Mercados de 2 vias (e os de 3 vias, com `draw`) de um jogo de esporte tradicional.
+ * Handicap: `hcp=<linha da casa>`; total: `total=<linha>`. Só linhas x.5.
+ */
+export function stakeSportMarkets(sport: string, fx: StakeFixture): SportOdds[] {
+  const [home, away] = (fx.data?.competitors ?? []).map((c) => c.name);
+  if (!home || !away) return [];
+  const out: SportOdds[] = [];
+  const templates = TRAD_TEMPLATES[sport] ?? {};
+  const seen = new Set<string>();
+  const markets = (extId: string) =>
+    (fx.main ?? [])
+      .flatMap((g) => g.templates.filter((t) => t.extId === extId).flatMap((t) => t.markets))
+      // O mesmo template aparece em mais de um grupo (ex.: "main" e "winner").
+      .filter((m) => !seen.has(`${extId}:${m.id}`) && seen.add(`${extId}:${m.id}`));
+
+  if (sport === "soccer") {
+    for (const m of markets("1")) {
+      const odds = threeWayOdds(m, home, away);
+      if (odds) out.push({ ...odds, spec: WINNER });
+    }
+  }
+
+  for (const [extId, tpl] of Object.entries(templates)) {
+    for (const m of markets(extId)) {
+      const spec = specifiers(m.specifiers);
+      if (tpl.only && spec[tpl.only[0]] !== tpl.only[1]) continue;
+      const side = (re: RegExp) => m.outcomes.find((o) => re.test(o.name.trim()));
+      let line: number | undefined;
+      let odds: TwoWayOdds | null;
+      if (tpl.sel === "three") {
+        const three = threeWayOdds(m, home, away);
+        if (three) out.push({ ...three, spec: tpl.period ? { type: tpl.type, period: tpl.period } : { type: tpl.type } });
+        continue;
+      }
+      if (tpl.sel === "ou") {
+        line = Number(spec.total);
+        if (!isHalfLine(line)) continue;
+        odds = pairOdds(m, side(/^over\b/i), side(/^under\b/i));
+      } else if (tpl.sel === "yesno") {
+        odds = pairOdds(m, side(/^yes$/i), side(/^no$/i));
+      } else {
+        if (tpl.type === "handicap") {
+          line = Number(spec.hcp);
+          if (!isHalfLine(line)) continue;
+        }
+        odds = pairOdds(m, ...homeAway(m, home, away));
+      }
+      if (!odds) continue;
+      const ms: MarketSpec = { type: tpl.type };
+      if (line !== undefined) ms.line = line;
+      if (tpl.period) ms.period = tpl.period;
+      out.push({ ...odds, spec: ms });
+    }
+  }
+  return out;
+}
+
+/**
+ * `markets.ts` ainda sem suporte a um tipo/período devolve uma chave que colide com outro
+ * mercado (o `winner` do evento, ou o mesmo handicap do jogo inteiro): esses ficam de fora.
+ */
+export function marketKeySupported(spec: MarketSpec): boolean {
+  const k = marketKey(spec);
+  if (spec.type !== "winner" && k === "win") return false;
+  if (spec.period && !k.includes(spec.period)) return false;
+  return true;
 }
 
 export class StakeBlockedError extends Error {}
@@ -323,6 +511,9 @@ export class StakeSource implements Source {
   readonly name = "stake";
   private stopped = true;
   private readonly fixtures = new Map<string, Tracked>();
+  /** Esportes tradicionais: mapa à parte (o ingest dos eSports apaga o que não vê) */
+  private readonly tradFixtures = new Map<string, Tracked>();
+  private tradLastFullAt = 0;
   private readonly published = new Map<string, string>();
   private readonly fixtureKeys = new Map<string, Set<string>>();
   private readonly latency = new Ewma();
@@ -356,6 +547,7 @@ export class StakeSource implements Source {
     this.state = "connecting";
     void this.loop();
     void this.hotLoop();
+    void this.tradLoop();
   }
 
   stop(): void {
@@ -661,6 +853,112 @@ export class StakeSource implements Source {
     }
   }
 
+  /**
+   * Esportes tradicionais num ciclo próprio e mais lento que o dos eSports: o ao vivo de todos os
+   * esportes numa requisição a cada `tradLiveIntervalMs`; o pré-jogo paginado a cada
+   * `tradPrematchIntervalMs`, até `tradPrematchMax` jogos por esporte dentro de `tradHorizonH`.
+   * Só com o cliente TLS e com o feed principal conectado (bloqueado, não insiste).
+   */
+  private async tradLoop(): Promise<void> {
+    const sports = (this.opts.tradSports ?? []).filter((s) => s in STAKE_TRAD_SPORTS);
+    if (!sports.length) return;
+    const liveMs = Math.max(MIN_INTERVAL_MS, this.opts.tradLiveIntervalMs ?? 3_000);
+    const fullMs = this.opts.tradPrematchIntervalMs ?? 60_000;
+    let failures = 0;
+    while (!this.stopped) {
+      const startedAt = Date.now();
+      if (!this.opts.useTlsClient || this.state !== "connected") {
+        await sleep(liveMs);
+        continue;
+      }
+      try {
+        const live = await this.fetchSports(sports, "live", 0);
+        this.ingestTrad(sports, live, true);
+        if (startedAt - this.tradLastFullAt >= fullMs) {
+          await this.loadTradPrematch(sports);
+          this.tradLastFullAt = startedAt;
+        }
+        failures = 0;
+        await sleep(Math.max(0, liveMs - (Date.now() - startedAt)));
+      } catch (err) {
+        failures++;
+        if (failures === 1 || failures % 10 === 0) this.log.warn(`esportes tradicionais falharam (${failures}x)`, err);
+        const blocked = err instanceof StakeBlockedError;
+        await sleep(backoffDelay(failures - 1, liveMs, blocked ? 120_000 : 60_000));
+      }
+    }
+  }
+
+  private async fetchSports(sports: string[], type: "live" | "upcoming", offset: number): Promise<StakeResponse> {
+    const body = await this.fetchWithTlsClient({
+      query: buildStakeSportsQuery(sports, type, offset),
+      operationName: "StakeSports",
+    });
+    if (!body.data) throw new Error(body.errors?.[0]?.message ?? "resposta sem data");
+    return body;
+  }
+
+  /** Pré-jogo paginado: cada página leva só os esportes que ainda têm jogos dentro da janela. */
+  private async loadTradPrematch(sports: string[]): Promise<void> {
+    const max = this.opts.tradPrematchMax ?? 150;
+    const horizon = Date.now() + (this.opts.tradHorizonH ?? 48) * 3_600_000;
+    const lists = new Map<string, StakeFixture[]>(sports.map((s) => [s, []]));
+    let pending = [...sports];
+    for (let offset = 0; pending.length && offset < max; offset += TRAD_PAGE) {
+      const body = await this.fetchSports(pending, "upcoming", offset);
+      const next: string[] = [];
+      pending.forEach((sport, i) => {
+        const page = (body.data?.[`t${i}`] as unknown as { list?: StakeFixture[] } | null)?.list;
+        if (!page) {
+          lists.delete(sport); // falhou: mantém o que já havia desse esporte
+          return;
+        }
+        const inWindow = page.filter((fx) => {
+          const t = Date.parse(fx.data?.startTime ?? "");
+          return !Number.isFinite(t) || t <= horizon;
+        });
+        lists.get(sport)!.push(...inWindow);
+        if (page.length === TRAD_PAGE && inWindow.length === page.length) next.push(sport);
+      });
+      pending = next;
+    }
+    const seen = new Set<string>();
+    for (const [sport, list] of lists) {
+      for (const fx of list.slice(0, max)) {
+        seen.add(fx.id);
+        if (this.tradFixtures.get(fx.id)?.live) continue;
+        this.tradFixtures.set(fx.id, { sport, fx, live: false });
+        this.sync(fx.id);
+      }
+    }
+    for (const [id, t] of this.tradFixtures) {
+      if (t.live || seen.has(id) || !lists.has(t.sport)) continue;
+      this.tradFixtures.delete(id);
+      this.sync(id);
+    }
+  }
+
+  /** Ao vivo: quem saiu da lista acabou (ou voltou ao pré-jogo, que o ciclo lento traz de novo). */
+  private ingestTrad(sports: string[], body: StakeResponse, live: boolean): void {
+    const seen = new Set<string>();
+    const ok = new Set<string>();
+    sports.forEach((sport, i) => {
+      const list = (body.data?.[`t${i}`] as unknown as { list?: StakeFixture[] } | null)?.list;
+      if (!list) return;
+      ok.add(sport);
+      for (const fx of list) {
+        seen.add(fx.id);
+        this.tradFixtures.set(fx.id, { sport, fx, live });
+        this.sync(fx.id);
+      }
+    });
+    for (const [id, t] of this.tradFixtures) {
+      if (!t.live || seen.has(id) || !ok.has(t.sport)) continue;
+      this.tradFixtures.delete(id);
+      this.sync(id);
+    }
+  }
+
   private async loop(): Promise<void> {
     const intervalMs = Math.max(MIN_INTERVAL_MS, this.opts.intervalMs);
     let failures = 0;
@@ -688,7 +986,8 @@ export class StakeSource implements Source {
         const liveCount = [...this.fixtures.values()].filter(
           (t) => t.live,
         ).length;
-        this.detail = `${this.fixtures.size} eventos · ${liveCount} ao vivo`;
+        const trad = this.tradFixtures.size ? ` · ${this.tradFixtures.size} de esportes` : "";
+        this.detail = `${this.fixtures.size} eventos · ${liveCount} ao vivo${trad}`;
         const wait = liveCount === 0 ? Math.max(intervalMs, IDLE_INTERVAL_MS) : intervalMs;
         await sleep(Math.max(0, wait - (Date.now() - startedAt)));
       } catch (err) {
@@ -741,17 +1040,21 @@ export class StakeSource implements Source {
 
   private sync(id: string): void {
     const eventKey = `stake:${id}`;
-    const t = this.fixtures.get(id);
+    const t = this.fixtures.get(id) ?? this.tradFixtures.get(id);
     const keys = new Set<string>();
     const [home, away] = (t?.fx.data?.competitors ?? []).map((c) => c.name);
-    const game = t && STAKE_SPORTS[t.sport];
+    const trad = !!t && t.sport in STAKE_TRAD_SPORTS;
+    const game = t && (STAKE_SPORTS[t.sport] ?? STAKE_TRAD_SPORTS[t.sport]);
     if (t && game && home && away) {
       const tradable = !CLOSED.has(t.fx.status);
-      for (const odds of stakeMarkets(t.fx)) {
-        const fields = derivedQuoteFields(eventKey, odds.spec, home, away);
+      const all: SportOdds[] = trad ? stakeSportMarkets(t.sport, t.fx) : stakeMarkets(t.fx);
+      for (const odds of all) {
+        if (!marketKeySupported(odds.spec)) continue;
+        const fields = derivedQuoteFields(eventKey, odds.spec, home, away, game);
+        if (keys.has(fields.key)) continue;
         keys.add(fields.key);
         const suspended = odds.suspended || !tradable;
-        const sig = `${odds.a}|${odds.b}|${suspended}`;
+        const sig = `${odds.a}|${odds.b}|${odds.draw}|${suspended}`;
         const prev = this.store.get(fields.key);
         if (this.published.get(fields.key) === sig && prev) {
           prev.updatedAt = Date.now();
@@ -763,6 +1066,8 @@ export class StakeSource implements Source {
           ...fields,
           oddsA: odds.a,
           oddsB: odds.b,
+          // 1X2: presença de `oddsDraw` (mesmo null) marca o mercado como 3 vias.
+          ...(odds.draw !== undefined ? { oddsDraw: odds.draw } : {}),
           suspended,
         });
       }

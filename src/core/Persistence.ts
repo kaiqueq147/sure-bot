@@ -466,7 +466,8 @@ function parseTaken(raw: unknown): TakenInput | { error: string } {
         };
       })
     : [];
-  if (!oppId || !eventName || legs.length !== 2) return { error: 'faltam o id, o jogo ou as duas pernas' };
+  // 3 pernas na arbitragem de 3 vias (1X2): a stake do empate fica só em `legs`.
+  if (!oppId || !eventName || legs.length < 2 || legs.length > 3) return { error: 'faltam o id, o jogo ou as pernas' };
   if (legs.some((l) => !l.book || !l.selection || !(l.odds > 1))) return { error: 'pernas incompletas' };
   const bankroll = num('bankroll');
   const stakeA = num('stakeA');

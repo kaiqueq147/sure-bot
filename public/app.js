@@ -22,8 +22,17 @@ const GAMES = {
   rl: { label: 'Rocket League', color: '#4361ee' },
   cod: { label: 'Call of Duty', color: '#84cc16' },
   other: { label: 'eSports', color: '#8a96ad' },
+  soccer: { label: 'Futebol', color: '#22c55e' },
+  basketball: { label: 'Basquete', color: '#fb923c' },
+  baseball: { label: 'Beisebol', color: '#ef4444' },
+  tennis: { label: 'Tênis', color: '#c6d93a' },
+  american_football: { label: 'Futebol americano', color: '#b45309' },
 };
 const gameMeta = (g) => GAMES[g] ?? GAMES.other;
+
+/** Esportes tradicionais (aba "Esportes"); o resto é eSports. Igual a SPORT_GAMES do servidor. */
+const SPORT_GAMES = new Set(['soccer', 'basketball', 'baseball', 'tennis', 'american_football']);
+const isSport = (g) => SPORT_GAMES.has(g);
 
 function gameBadge(el, game) {
   const meta = gameMeta(game);
@@ -54,7 +63,12 @@ const state = {
   minProfit: Number(localStorage.getItem('minProfit')) || 0,
   game: 'all',
   onlyConfirmed: false,
-  tab: ['ev', 'hist'].includes(localStorage.getItem('tab')) ? localStorage.getItem('tab') : 'arb',
+  /** Categoria: esports ou sports (esportes tradicionais); cada uma tem as mesmas abas */
+  universe: savedUniverse(),
+  /** Aba: arb | ev | hist */
+  tab: savedTab(),
+  /** Cards renderizados por lista (o resto fica atrás do "mostrar mais") */
+  limit: { arb: 60, ev: 60 },
   taken: new Set(),
   ev: new Map(), // id -> { bet, el }
   minEv: Number(localStorage.getItem('minEv') || 0),
@@ -73,6 +87,25 @@ const state = {
   blocked: [],
 };
 
+/** O que a tela mostra agora: arb | ev | hist. */
+const view = () => state.tab;
+/** O item pertence à categoria escolhida (eSports ou esportes)? */
+const inCategory = (game) => isSport(game) === (state.universe === 'sports');
+
+/** Versões antigas guardavam a aba "sports" + sportsView; migra para categoria + aba. */
+function savedUniverse() {
+  const u = localStorage.getItem('universe');
+  if (u === 'sports' || u === 'esports') return u;
+  return localStorage.getItem('tab') === 'sports' ? 'sports' : 'esports';
+}
+function savedTab() {
+  const t = localStorage.getItem('tab');
+  if (t === 'sports') return localStorage.getItem('sportsView') === 'ev' ? 'ev' : 'arb';
+  return t === 'ev' || t === 'hist' ? t : 'arb';
+}
+/** Cards por "página" de cada lista. */
+const PAGE = 60;
+
 function readCaps() {
   try {
     const raw = JSON.parse(localStorage.getItem('bookCaps') ?? '{}');
@@ -84,11 +117,11 @@ function readCaps() {
 
 // ------------------------------------------------------------------ cálculos
 
-function splitStakes(bankroll, o1, o2) {
-  const margin = 1 / o1 + 1 / o2;
-  const s1 = (bankroll / o1) / margin;
-  const s2 = (bankroll / o2) / margin;
-  return { s1, s2, payout: bankroll / margin, profit: bankroll / margin - bankroll };
+/** Stakes que igualam o retorno em todas as pernas: cada uma proporcional a 1/odd. */
+function splitStakes(bankroll, odds) {
+  const margin = odds.reduce((m, o) => m + 1 / o, 0);
+  const stakes = odds.map((o) => bankroll / o / margin);
+  return { stakes, payout: bankroll / margin, profit: bankroll / margin - bankroll };
 }
 
 const applyCommission = (odds, pct) => (pct ? 1 + (odds - 1) * (1 - pct / 100) : odds);
@@ -117,20 +150,15 @@ function legExec(leg, usd) {
  * depende da odd, então algumas iterações bastam para convergir.
  */
 function planArb(opp, bankroll) {
-  const [a, b] = opp.legs;
-  let oa = a.effectiveOdds;
-  let ob = b.effectiveOdds;
+  let odds = opp.legs.map((l) => l.effectiveOdds);
   let short = false;
   for (let i = 0; i < 4; i++) {
-    const { s1, s2 } = splitStakes(bankroll, oa, ob);
-    const ea = legExec(a, s1);
-    const eb = legExec(b, s2);
-    oa = ea.odds;
-    ob = eb.odds;
-    short = ea.filled < s1 - 0.01 || eb.filled < s2 - 0.01;
+    const { stakes } = splitStakes(bankroll, odds);
+    const execs = opp.legs.map((leg, j) => legExec(leg, stakes[j]));
+    odds = execs.map((e) => e.odds);
+    short = execs.some((e, j) => e.filled < stakes[j] - 0.01);
   }
-  const split = splitStakes(bankroll, oa, ob);
-  return { ...split, oa, ob, short };
+  return { ...splitStakes(bankroll, odds), odds, short };
 }
 
 const MAX_SEARCH_BANKROLL = 100_000;
@@ -156,7 +184,7 @@ function maxBankroll(opp) {
 
 /**
  * Plano respeitando o limite de aposta de cada casa: se uma perna passa do máximo, a banca
- * inteira encolhe na mesma proporção (as duas pernas continuam cobrindo o mesmo retorno).
+ * inteira encolhe na mesma proporção (todas as pernas continuam cobrindo o mesmo retorno).
  */
 function planCapped(opp, bankroll) {
   let used = bankroll;
@@ -167,7 +195,7 @@ function planCapped(opp, bankroll) {
     let f = 1;
     opp.legs.forEach((leg, j) => {
       const cap = state.bookCaps[leg.book];
-      const stake = j === 0 ? plan.s1 : plan.s2;
+      const stake = plan.stakes[j];
       if (cap && stake > cap + 0.005) {
         f = Math.min(f, cap / stake);
         limited.add(leg.book);
@@ -192,6 +220,7 @@ function connect() {
 
   ws.onopen = () => {
     retry = 0;
+    lastWatch = null;
     setConn('ok', 'Dashboard ao vivo');
   };
   ws.onmessage = (ev) => handle(JSON.parse(ev.data));
@@ -465,6 +494,10 @@ function renderDetected(d) {
 
 // ------------------------------------------------------------------ cards
 
+/**
+ * Só guarda o dado e marca o card como sujo: a renderização (cara: plano da banca, livro) sai no
+ * próximo quadro e só para os cards visíveis da aba atual (ver layoutFeeds).
+ */
 function upsert(opp) {
   let entry = state.opps.get(opp.id);
   const isNew = !entry;
@@ -473,14 +506,15 @@ function upsert(opp) {
     state.opps.set(opp.id, entry);
     $('#feed').append(entry.el);
   }
-  const prev = entry.opp;
-  const wasConfirmed = !isNew && prev.status === 'confirmed';
+  const wasConfirmed = !isNew && entry.opp.status === 'confirmed';
   entry.opp = opp;
   if (entry.closed) {
     clearTimeout(entry.removeTimer);
     entry.closed = false;
   }
-  renderCard(entry, isNew ? null : prev);
+  entry.dirty = true;
+  applyFilter(entry);
+  scheduleSort();
   if (isNew) scheduleHistory();
 
   if (opp.status === 'confirmed' && !wasConfirmed && passesFilter(opp) && shouldAlert(opp.id)) alertUser(opp);
@@ -547,27 +581,70 @@ function scheduleSort() {
   sortQueued = true;
   requestAnimationFrame(() => {
     sortQueued = false;
-    const order = (entries, kind, pick) =>
-      entries
-        .map((e) => [e, sortValue(kind, pick(e))])
-        .sort((x, y) => y[1] - x[1])
-        .forEach(([e], i) => (e.el.style.order = String(i)));
-    order([...state.opps.values()], 'arb', (e) => e.opp);
-    order([...state.ev.values()], 'ev', (e) => e.bet);
+    layoutFeeds();
   });
+}
+
+/**
+ * Ordena cada lista e renderiza só a "página" visível da aba atual: com os esportes são
+ * milhares de oportunidades/EVs e renderizar todas a cada tick travaria o painel.
+ * Cards fora da página (`beyond`) ficam escondidos e sujos até entrarem nela.
+ */
+function layoutFeeds() {
+  const v = view();
+  const lists = [
+    ['arb', state.opps, (e) => e.opp, (e) => renderCard(e, e.rendered ?? null)],
+    ['ev', state.ev, (e) => e.bet, (e) => renderEvCard(e, e.rendered ?? null)],
+  ];
+  for (const [kind, map, pick, render] of lists) {
+    const shown = [...map.values()]
+      .filter((e) => !e.el.hidden)
+      .map((e) => [e, sortValue(kind, pick(e))])
+      .sort((x, y) => y[1] - x[1]);
+    shown.forEach(([e], i) => {
+      e.el.style.order = String(i);
+      const off = i >= state.limit[kind];
+      e.el.classList.toggle('beyond', off);
+      e.beyond = off || kind !== v;
+      if (!e.beyond && e.dirty) render(e);
+    });
+    const more = $(`#${kind}-more`);
+    const rest = shown.length - state.limit[kind];
+    more.hidden = rest <= 0;
+    if (rest > 0) more.textContent = `Mostrar mais ${Math.min(rest, PAGE)} (de ${rest} restantes)`;
+  }
+  sendWatch();
+}
+
+/**
+ * Diz ao servidor quais quotes estão na tela: as idades das odds (a cada 2s) vêm só dessas
+ * chaves em vez de todas as pernas e linhas de EV abertas.
+ */
+let lastWatch = null;
+function sendWatch() {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  const keys = new Set();
+  const v = view();
+  if (v === 'arb') for (const e of state.opps.values()) if (!e.el.hidden && !e.beyond) for (const l of e.opp.legs) keys.add(l.key);
+  if (v === 'ev') for (const e of state.ev.values()) if (!e.el.hidden && !e.beyond) for (const b of e.bet.books) keys.add(b.key);
+  const list = [...keys].sort();
+  const sig = list.join(',');
+  if (sig === lastWatch) return;
+  lastWatch = sig;
+  ws.send(JSON.stringify({ type: 'watch', keys: list }));
 }
 
 function renderSortOptions() {
   const select = $('#sort');
   select.replaceChildren(
-    ...SORTS[state.tab].map(([value, label]) => {
+    ...SORTS[view()].map(([value, label]) => {
       const o = document.createElement('option');
       o.value = value;
       o.textContent = label;
       return o;
     }),
   );
-  select.value = state.sort[state.tab];
+  select.value = state.sort[view()];
 }
 
 function createCard(id) {
@@ -576,7 +653,7 @@ function createCard(id) {
   $('.open-both', el).addEventListener('click', () => {
     const entry = state.opps.get(id);
     // Navegadores podem bloquear a segunda aba como pop-up; os botões individuais servem de alternativa.
-    for (const leg of entry.opp.legs) window.open(leg.url, '_blank', 'noopener');
+    for (const url of new Set(entry.opp.legs.map((l) => l.url))) window.open(url, '_blank', 'noopener');
   });
   $('.take', el).addEventListener('click', () => takeOpportunity(id));
   $('.wrong-pair', el).addEventListener('click', () => {
@@ -629,16 +706,17 @@ async function takeOpportunity(id) {
         startTime: opp.startTime,
         profitPct: plan.bankroll > 0 ? (plan.profit / plan.bankroll) * 100 : opp.profitPct,
         bankroll: plan.bankroll,
-        stakeA: plan.s1,
-        stakeB: plan.s2,
+        // A stake do empate (3ª perna do 1X2) vai só em `legs`.
+        stakeA: plan.stakes[0],
+        stakeB: plan.stakes[1],
         payout: plan.payout,
         profit: plan.profit,
         legs: opp.legs.map((leg, i) => ({
           book: leg.book,
           selection: leg.selection,
-          odds: i === 0 ? plan.oa : plan.ob,
-          effectiveOdds: i === 0 ? plan.oa : plan.ob,
-          stake: i === 0 ? plan.s1 : plan.s2,
+          odds: plan.odds[i],
+          effectiveOdds: plan.odds[i],
+          stake: plan.stakes[i],
           url: leg.url,
         })),
       }),
@@ -655,6 +733,8 @@ async function takeOpportunity(id) {
 
 function renderCard(entry, prev) {
   const { opp, el } = entry;
+  entry.dirty = false;
+  entry.rendered = opp;
   el.classList.toggle('confirmed', opp.status === 'confirmed' && !entry.closed);
   el.classList.toggle('closed', entry.closed);
   scheduleSort();
@@ -678,9 +758,14 @@ function renderCard(entry, prev) {
   $('.sub', el).textContent = parts.join(' · ');
 
   let oddsChanged = false;
+  // 1X2 do futebol: 3 pernas (time A, empate, time B).
+  $('.legs', el).classList.toggle('three', opp.legs.length === 3);
+  el.querySelectorAll('.leg').forEach((box, i) => (box.hidden = i >= opp.legs.length));
+  const urls = new Set(opp.legs.map((l) => l.url)).size;
+  $('.open-both-text', el).textContent = urls === 2 ? 'Abrir as duas casas' : `Abrir as ${urls} apostas`;
   opp.legs.forEach((leg, i) => {
     const box = el.querySelector(`.leg[data-i="${i}"]`);
-    box.className = `leg ${leg.book}`;
+    box.className = `leg ${leg.book}${leg.side === 'D' ? ' draw' : ''}`;
     box.style.setProperty('--book', BOOKS[leg.book]?.color ?? '#3b82f6');
     $('.book', box).textContent = BOOK_LABEL[leg.book] ?? leg.book;
     const oddsBox = $('.odds-box', box);
@@ -694,7 +779,7 @@ function renderCard(entry, prev) {
       oddsBox.classList.add(dir);
       $('.trend', box).style.setProperty('--icon', uiIcon(`arrow-${dir}`));
     }
-    $('.selection', box).textContent = leg.selection;
+    $('.selection', box).textContent = leg.selection || (leg.side === 'D' ? 'Empate' : '');
     const link = $('.open', box);
     link.href = leg.url;
     $('.open-text', link).textContent = `Abrir ${BOOK_LABEL[leg.book] ?? leg.book}`;
@@ -761,10 +846,10 @@ function renderCalc(entry) {
     const who = plan.limited.map((b) => `${BOOK_LABEL[b] ?? b} (${fmtMoney(state.bookCaps[b])})`).join(' e ');
     $('.cap-text', capNote).textContent = `Limitado pelo máximo da ${who}: banca usada ${fmtMoney(bankroll)} de ${fmtMoney(state.bankroll)}`;
   }
-  [plan.s1, plan.s2].forEach((stake, i) => {
+  plan.stakes.forEach((stake, i) => {
     const box = el.querySelector(`.leg[data-i="${i}"]`);
     const leg = opp.legs[i];
-    const exec = i === 0 ? plan.oa : plan.ob;
+    const exec = plan.odds[i];
     $('.stake', box).textContent = fmtMoney(stake);
     $('.leg-return', box).textContent = fmtMoney(stake * exec);
     const eff = [];
@@ -811,7 +896,8 @@ function markClosed(id, reason) {
   if (!entry || entry.closed) return;
   entry.closed = true;
   entry.reason = reason;
-  renderCard(entry, entry.opp);
+  entry.dirty = true;
+  scheduleSort();
   entry.removeTimer = setTimeout(() => removeCard(id, entry), CLOSED_TTL_MS);
   updateEmpty();
 }
@@ -820,6 +906,7 @@ function removeCard(id, entry) {
   clearTimeout(entry.removeTimer);
   entry.el.remove();
   state.opps.delete(id);
+  scheduleSort();
   updateEmpty();
 }
 
@@ -841,6 +928,7 @@ function removeEv(id) {
   if (!entry) return;
   entry.el.remove();
   state.ev.delete(id);
+  scheduleSort();
 }
 
 function upsertEv(bet, { silent = false } = {}) {
@@ -851,9 +939,10 @@ function upsertEv(bet, { silent = false } = {}) {
     state.ev.set(bet.id, entry);
     $('#ev-feed').append(entry.el);
   }
-  const prev = entry.bet;
   entry.bet = bet;
-  renderEvCard(entry, isNew ? null : prev);
+  entry.dirty = true;
+  entry.el.hidden = !(inCategory(bet.game) && passesEvFilter(bet));
+  scheduleSort();
   if (isNew) scheduleHistory();
   if (isNew && !silent && passesEvFilter(bet) && shouldAlert(bet.id)) alertEv(bet);
 }
@@ -882,6 +971,8 @@ function tickFrozenWarning(entry, now) {
 
 function renderEvCard(entry, prev) {
   const { bet, el } = entry;
+  entry.dirty = false;
+  entry.rendered = bet;
   scheduleSort();
   el.style.setProperty('--g', gameMeta(bet.game).color);
   gameBadge($('.game', el), bet.game);
@@ -993,7 +1084,7 @@ function renderEvCard(entry, prev) {
   link.href = best.url;
   $('span', link).textContent = `Apostar na ${BOOK_LABEL[best.book]}`;
   $('.age-text', el).textContent = '';
-  el.hidden = !passesEvFilter(bet);
+  el.hidden = !(inCategory(bet.game) && passesEvFilter(bet));
 }
 
 function passesEvFilter(bet) {
@@ -1021,15 +1112,21 @@ function alertEv(bet) {
 function setTab(tab) {
   state.tab = tab;
   localStorage.setItem('tab', tab);
-  document.body.dataset.tab = tab;
-  $('#tab-arb').hidden = tab !== 'arb';
-  $('#tab-ev').hidden = tab !== 'ev';
-  $('#tab-hist').hidden = tab !== 'hist';
+  const v = view();
+  document.body.dataset.tab = v;
+  document.body.dataset.universe = state.universe;
+  for (const b of document.querySelectorAll('.uni')) b.setAttribute('aria-pressed', String(b.dataset.universe === state.universe));
+  $('#tab-arb').hidden = v !== 'arb';
+  $('#tab-ev').hidden = v !== 'ev';
+  $('#tab-hist').hidden = v !== 'hist';
   for (const b of document.querySelectorAll('.tab')) b.classList.toggle('active', b.dataset.tab === tab);
+  // Chip de modalidade da outra categoria não existe aqui.
+  if (state.game !== 'all' && !inCategory(state.game)) state.game = 'all';
+  state.limit = { arb: PAGE, ev: PAGE };
   chipsSig = '';
   if (tab === 'hist') return void loadReport();
   renderSortOptions();
-  updateEmpty();
+  refreshAll();
   scheduleHistory();
 }
 
@@ -1038,16 +1135,18 @@ function setTab(tab) {
 let chipsSig = '';
 function renderChips() {
   const counts = {};
-  if (state.tab === 'ev') {
-    for (const e of state.ev.values()) if (passesEvFilter({ ...e.bet, game: state.game === 'all' ? e.bet.game : state.game })) counts[e.bet.game] = (counts[e.bet.game] ?? 0) + 1;
+  if (view() === 'ev') {
+    for (const e of state.ev.values())
+      if (inCategory(e.bet.game) && passesEvFilter({ ...e.bet, game: state.game === 'all' ? e.bet.game : state.game }))
+        counts[e.bet.game] = (counts[e.bet.game] ?? 0) + 1;
   } else {
-    for (const e of state.opps.values()) if (!e.closed) counts[e.opp.game] = (counts[e.opp.game] ?? 0) + 1;
+    for (const e of state.opps.values()) if (!e.closed && inCategory(e.opp.game)) counts[e.opp.game] = (counts[e.opp.game] ?? 0) + 1;
   }
   const sig = `${state.game}|${JSON.stringify(counts)}`;
   if (sig === chipsSig) return;
   chipsSig = sig;
   const box = $('#game-chips');
-  const chips = [['all', { label: 'Todas', color: '#e6ebf5' }], ...Object.entries(GAMES)];
+  const chips = [['all', { label: 'Todas', color: '#e6ebf5' }], ...Object.entries(GAMES).filter(([g]) => inCategory(g))];
   box.replaceChildren(
     ...chips.map(([id, meta]) => {
       const chip = document.createElement('button');
@@ -1081,25 +1180,53 @@ function passesFilter(opp) {
 }
 
 function applyFilter(entry) {
-  entry.el.hidden = !passesFilter(entry.opp);
+  entry.el.hidden = !(inCategory(entry.opp.game) && passesFilter(entry.opp));
 }
 
+/** Contadores e estados vazios: um por quadro (chegam dezenas de mensagens por segundo). */
+let emptyQueued = false;
 function updateEmpty() {
-  const arbVisible = [...state.opps.values()].filter((e) => !e.el.hidden).length;
-  const evVisible = [...state.ev.values()].filter((e) => !e.el.hidden).length;
-  $('#empty').hidden = arbVisible > 0;
-  $('#ev-empty').hidden = evVisible > 0;
-  $('#arb-count').textContent = arbVisible;
-  $('#ev-count').textContent = evVisible;
+  if (emptyQueued) return;
+  emptyQueued = true;
+  requestAnimationFrame(() => {
+    emptyQueued = false;
+    renderCounts();
+  });
+}
+
+function renderCounts() {
+  const n = { arb: [0, 0], ev: [0, 0] }; // [eSports, esportes]
+  let arbShown = 0;
+  for (const e of state.opps.values()) {
+    if (!e.el.hidden) arbShown++;
+    if (!e.closed && passesFilter(e.opp)) n.arb[isSport(e.opp.game) ? 1 : 0]++;
+  }
+  let evShown = 0;
+  for (const e of state.ev.values()) {
+    if (!e.el.hidden) evShown++;
+    if (passesEvFilter(e.bet)) n.ev[isSport(e.bet.game) ? 1 : 0]++;
+  }
+  $('#empty').hidden = arbShown > 0;
+  $('#ev-empty').hidden = evShown > 0;
+  const u = state.universe === 'sports' ? 1 : 0;
+  $('#arb-count').textContent = n.arb[u];
+  $('#ev-count').textContent = n.ev[u];
+  $('#esports-count').textContent = n.arb[0] + n.ev[0];
+  $('#sports-count').textContent = n.arb[1] + n.ev[1];
   renderChips();
 }
 
+/** Filtros ou banca mudaram: reaplica a visibilidade e marca tudo para re-renderizar. */
 function refreshAll() {
   for (const entry of state.opps.values()) {
     applyFilter(entry);
-    renderCalc(entry);
+    entry.dirty = true;
   }
-  for (const entry of state.ev.values()) entry.el.hidden = !passesEvFilter(entry.bet);
+  for (const entry of state.ev.values()) {
+    entry.el.hidden = !(inCategory(entry.bet.game) && passesEvFilter(entry.bet));
+    entry.dirty = true;
+  }
+  scheduleSort();
   updateEmpty();
 }
 
@@ -1118,8 +1245,8 @@ async function refreshHistory() {
   clearTimeout(historyTimer);
   historyTimer = setTimeout(refreshHistory, HISTORY_POLL_MS);
   if (document.hidden || state.tab === 'hist' || document.body.classList.contains('compact')) return;
-  const entries = state.tab === 'ev' ? [...state.ev.values()] : [...state.opps.values()];
-  const visible = entries.filter((e) => !e.el.hidden);
+  const entries = view() === 'ev' ? [...state.ev.values()] : [...state.opps.values()];
+  const visible = entries.filter((e) => !e.el.hidden && !e.beyond && !e.dirty);
   const keys = new Set();
   for (const e of visible) {
     for (const x of e.opp ? e.opp.legs : e.bet.books) if (x.key) keys.add(x.key);
@@ -1142,7 +1269,8 @@ function oddsAt(samples, side, t) {
   let v = null;
   for (const s of samples) {
     if (s[0] > t) break;
-    v = side === 'B' ? s[2] : s[1];
+    // Amostra [t, oddA, oddB, oddEmpate?]; o empate só existe no 1X2.
+    v = side === 'B' ? s[2] : side === 'D' ? (s[3] ?? null) : s[1];
   }
   return v;
 }
@@ -1187,15 +1315,12 @@ const fmtPct = (v) => `${(v * 100).toFixed(1).replace('.', ',')}%`;
 
 function drawArbChart(entry) {
   const { opp, el } = entry;
-  const [a, b] = opp.legs;
-  const sa = history.get(a.key) ?? [];
-  const sb = history.get(b.key) ?? [];
+  const series = opp.legs.map((l) => history.get(l.key) ?? []);
   const now = Date.now();
-  const times = [...new Set([...sa, ...sb].map((s) => s[0]))].sort((x, y) => x - y);
+  const times = [...new Set(series.flat().map((s) => s[0]))].sort((x, y) => x - y);
   const points = times.map((t) => {
-    const oa = oddsAt(sa, a.side, t);
-    const ob = oddsAt(sb, b.side, t);
-    return [t, oa && ob ? 1 / oa + 1 / ob : null];
+    const odds = opp.legs.map((l, i) => oddsAt(series[i], l.side, t));
+    return [t, odds.every((o) => o) ? odds.reduce((m, o) => m + 1 / o, 0) : null];
   });
   const vals = points.map((p) => p[1]).filter((v) => v != null);
   if (!vals.length) return chartEmpty(el, 'coletando histórico…');
@@ -1236,9 +1361,8 @@ function drawEvChart(entry) {
 function alertUser(opp) {
   if (state.sound) beep();
   if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
-    const [a, b] = opp.legs;
     new Notification(`+${opp.profitPct.toFixed(2)}% · ${opp.eventName}`, {
-      body: `${BOOK_LABEL[a.book]}: ${a.selection} @ ${a.odds.toFixed(2)}\n${BOOK_LABEL[b.book]}: ${b.selection} @ ${b.odds.toFixed(2)}`,
+      body: opp.legs.map((l) => `${BOOK_LABEL[l.book]}: ${l.selection} @ ${l.odds.toFixed(2)}`).join('\n'),
       tag: opp.id,
     });
   }
@@ -1413,6 +1537,19 @@ function initControls() {
     const tab = e.target.closest('.tab');
     if (tab) setTab(tab.dataset.tab);
   });
+  $('#universe').addEventListener('click', (e) => {
+    const uni = e.target.closest('.uni');
+    if (!uni || uni.dataset.universe === state.universe) return;
+    state.universe = uni.dataset.universe;
+    localStorage.setItem('universe', state.universe);
+    setTab(state.tab === 'hist' ? 'arb' : state.tab);
+  });
+  for (const more of document.querySelectorAll('.more')) {
+    more.addEventListener('click', () => {
+      state.limit[more.dataset.kind] += PAGE;
+      scheduleSort();
+    });
+  }
   $('#hist-period').value = localStorage.getItem('hist-period') ?? '24';
   $('#hist-period').addEventListener('change', (e) => {
     localStorage.setItem('hist-period', e.target.value);
@@ -1439,9 +1576,10 @@ function initControls() {
     $('#health-btn').setAttribute('aria-expanded', String(!panel.hidden));
   });
   $('#sort').addEventListener('change', (e) => {
-    if (!SORTS[state.tab]) return;
-    state.sort[state.tab] = e.target.value;
-    localStorage.setItem(`sort-${state.tab}`, e.target.value);
+    const kind = view();
+    if (!SORTS[kind]) return;
+    state.sort[kind] = e.target.value;
+    localStorage.setItem(`sort-${kind}`, e.target.value);
     scheduleSort();
   });
   setTab(state.tab);
@@ -1473,12 +1611,16 @@ function initControls() {
 
   setInterval(() => {
     const now = Date.now();
+    // Só os cards na tela: fora da página ou de outra aba ficam como estão.
+    const onScreen = (e) => !e.el.hidden && !e.beyond && !e.dirty;
     for (const entry of state.opps.values()) {
+      if (!onScreen(entry)) continue;
       const secs = Math.round((now - entry.opp.firstSeen) / 1000);
       $('.age-text', entry.el).textContent = `aberta há ${secs}s`;
       renderLegAges(entry, now);
     }
     for (const entry of state.ev.values()) {
+      if (!onScreen(entry)) continue;
       $('.age-text', entry.el).textContent = `há ${fmtAge(now - entry.bet.firstSeen)}`;
       tickFrozenWarning(entry, now);
       renderEvAges(entry, now);

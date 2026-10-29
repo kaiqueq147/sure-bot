@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { OddsStore } from '../src/core/OddsStore.js';
-import { BetbySource, mergeEvent, winnerOdds, type BetbyEvent } from '../src/sources/betby.js';
+import { BetbySource, mergeEvent, sportMarkets, winnerOdds, type BetbyEvent } from '../src/sources/betby.js';
 
 const event = (k4: string, k5: string, extra: Partial<BetbyEvent> = {}): BetbyEvent => ({
   desc: {
@@ -127,4 +127,48 @@ test('ciclo sem mudança renova updatedAt sem alterar changedAt', async () => {
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test('esportes tradicionais: 1X2 do futebol com empate e linhas x.5; basquete usa os mercados com prorrogação', () => {
+  const desc = (sport: string) => ({ ...event('1', '1').desc!, sport });
+  const soccer: BetbyEvent = {
+    desc: desc('1'),
+    markets: {
+      '1': { '': { '1': { k: '2.32' }, '2': { k: '3.4' }, '3': { k: '2.68' } } },
+      '16': { 'hcp=-1.5': { '1714': { k: '4.9' }, '1715': { k: '1.12' } }, 'hcp=-1': { '1714': { k: '4.0' }, '1715': { k: '1.18' } } },
+      '18': { 'total=2.5': { '12': { k: '2.76' }, '13': { k: '1.37' } }, 'total=3.5': { '12': { k: '5.0' }, '13': { k: '1.12' } } },
+    },
+  };
+  const s = sportMarkets(soccer, 'soccer');
+  const w = s.find((m) => m.spec.type === 'winner' && !m.spec.period);
+  assert.deepEqual([w?.a, w?.draw, w?.b], [2.32, 3.4, 2.68]);
+  assert.deepEqual(s.filter((m) => m.spec.type === 'handicap').map((m) => m.spec.line), [-1.5], 'linha inteira fica de fora');
+  assert.deepEqual(s.filter((m) => m.spec.type === 'total').map((m) => m.spec.line), [2.5, 3.5]);
+
+  const nba: BetbyEvent = {
+    desc: desc('2'),
+    markets: {
+      '219': { '': { '4': { k: '1.5' }, '5': { k: '2.6' } } },
+      '16': { 'hcp=-5.5': { '1714': { k: '1.9' }, '1715': { k: '1.9' } } },
+      '223': { 'hcp=-6.5': { '1714': { k: '1.95' }, '1715': { k: '1.85' } } },
+    },
+  };
+  const b = sportMarkets(nba, 'basketball');
+  assert.deepEqual(b.find((m) => m.spec.type === 'winner')?.draw, undefined, 'basquete é 2 vias');
+  assert.deepEqual(b.filter((m) => m.spec.type === 'handicap').map((m) => m.spec.line), [-6.5], 'ignora o handicap de tempo regulamentar (16)');
+});
+
+test('3 vias: 1X2 do 1º tempo (60) e resultado no tempo regulamentar (1) do basquete viram result3', () => {
+  const desc = (sport: string) => ({ ...event('1', '1').desc!, sport });
+  const soccer = sportMarkets({ desc: desc('1'), markets: { '60': { '': { '1': { k: '3.1' }, '2': { k: '2.05' }, '3': { k: '3.9' } } } } }, 'soccer');
+  const h1 = soccer.find((m) => m.spec.type === 'result3');
+  assert.deepEqual(h1?.spec, { type: 'result3', period: 'h1' });
+  assert.deepEqual([h1?.a, h1?.draw, h1?.b], [3.1, 2.05, 3.9]);
+  assert.equal(soccer.some((m) => m.spec.type === 'winner'), false, '1X2 de período não vira âncora');
+
+  const nba = sportMarkets({ desc: desc('2'), markets: { '1': { '': { '1': { k: '1.6' }, '2': { k: '15' }, '3': { k: '2.4', b: 1 } } } } }, 'basketball');
+  const reg = nba.find((m) => m.spec.type === 'result3');
+  assert.deepEqual(reg?.spec, { type: 'result3' });
+  assert.equal(reg?.draw, 15);
+  assert.equal(reg?.suspended, true, 'fora bloqueado suspende o mercado');
 });

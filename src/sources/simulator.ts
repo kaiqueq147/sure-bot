@@ -20,6 +20,17 @@ const MATCHES: SimMatch[] = [
   { game: 'hok', league: 'King Pro League', poly: ['Wolves', 'Hero JiuJing'], tp: ['Chongqing Wolves', 'Hero JiuJing'], duel: ['Wolves Esports', 'Hero Jiujing'] },
 ];
 
+/**
+ * Esportes tradicionais (aba "Esportes"): Polymarket × Duel. O futebol tem 1X2 (`oddsDraw`) e
+ * alterna janelas em que a Duel paga demais pelo mandante e a Polymarket pelo empate, abrindo
+ * uma arbitragem de 3 pernas; o basquete é moneyline de 2 vias.
+ */
+type SimSport = { game: Game; league: string; poly: [string, string]; duel: [string, string]; probs: [number, number, number] };
+const SPORTS: SimSport[] = [
+  { game: 'soccer', league: 'Brasileirão Série A', poly: ['Flamengo', 'Palmeiras'], duel: ['CR Flamengo', 'SE Palmeiras'], probs: [0.45, 0.27, 0.28] },
+  { game: 'basketball', league: 'NBA', poly: ['Los Angeles Lakers', 'Boston Celtics'], duel: ['LA Lakers', 'Boston Celtics'], probs: [0.42, 0, 0.58] },
+];
+
 interface SimState {
   prob: number;
   glitchUntil: number;
@@ -39,6 +50,7 @@ export class SimulatorSource implements Source {
     this.store.setTtl('thunderpick', 30_000);
     this.store.setTtl('duel', 30_000);
     MATCHES.forEach((_, i) => this.publish(i));
+    SPORTS.forEach((_, i) => this.publishSport(i));
     this.timer = setInterval(() => this.tick(), 700);
   }
 
@@ -66,6 +78,47 @@ export class SimulatorSource implements Source {
       s.glitchSide = Math.random() < 0.5 ? 'A' : 'B';
     }
     this.publish(i);
+    this.publishSport(Math.floor(Math.random() * SPORTS.length));
+  }
+
+  private publishSport(i: number): void {
+    const m = SPORTS[i];
+    const now = Date.now();
+    const start = now + (i + 2) * 3600_000;
+    const wobble = () => 1 + (Math.random() - 0.5) * 0.02;
+    const [pH, pD, pA] = m.probs;
+    // Janela de ~10s a cada 25s com preço errado nas duas casas (ver comentário de SPORTS).
+    const glitch = now % 25_000 < 10_000 ? 1.12 : 1;
+    const odds = (p: number, margin: number, boost = 1) => Math.round(((boost * wobble()) / (p * margin)) * 100) / 100;
+    const base = (book: 'polymarket' | 'duel', teams: [string, string]) => ({
+      key: `${book}:sim-sport-${i}`,
+      eventKey: `${book}:sim-sport-${i}`,
+      market: WINNER,
+      book,
+      marketId: `sim-sport-${i}`,
+      game: m.game,
+      league: m.league,
+      eventName: `${teams[0]} vs ${teams[1]} - ${m.league}`,
+      teamA: teams[0],
+      teamB: teams[1],
+      startTime: start,
+      updatedAt: now,
+    });
+    const draw = pD > 0;
+    this.store.upsert({
+      ...base('polymarket', m.poly),
+      oddsA: odds(pH, 1.02),
+      oddsB: odds(pA, 1.02),
+      oddsDraw: draw ? odds(pD, 1.02, glitch) : undefined,
+      url: 'https://polymarket.com/sports',
+    });
+    this.store.upsert({
+      ...base('duel', m.duel),
+      oddsA: odds(pH, 1.04, glitch),
+      oddsB: odds(pA, 1.04),
+      oddsDraw: draw ? odds(pD, 1.04) : undefined,
+      url: 'https://duel.com/sports',
+    });
   }
 
   private publish(i: number): void {

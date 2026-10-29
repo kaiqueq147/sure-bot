@@ -79,3 +79,12 @@ test('ignora mercado suspenso e de outras casas', () => {
   arb.evaluate();
   assert.equal(arb.list().length, 0);
 });
+
+test('ignora 1X2 de futebol: casa + fora não cobrem o empate', () => {
+  const store = new OddsStore();
+  const arb = new PolymarketSelfArb(store, { minProfitPct: 0, commissionPct: {} });
+  // Flamengo 0.40 + Palmeiras 0.35 "custa" $0.75, mas o empate (0.25) fica descoberto.
+  store.upsert(quote(0.4, 0.35, { game: 'soccer', teamA: 'Flamengo', teamB: 'Palmeiras', oddsDraw: 4 }));
+  arb.evaluate();
+  assert.equal(arb.list().length, 0);
+});

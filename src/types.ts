@@ -13,6 +13,12 @@ export type Game =
   | 'mlbb'
   | 'hok'
   | 'aov'
+  // Esportes tradicionais (aba "Esportes"): ver SPORT_GAMES em core/sports.ts
+  | 'soccer'
+  | 'basketball'
+  | 'baseball'
+  | 'tennis'
+  | 'american_football'
   | 'other';
 
 export type MarketType =
@@ -23,18 +29,36 @@ export type MarketType =
   | 'map_rounds_hcp'
   | 'map_rounds_total'
   | 'map_kills_hcp'
-  | 'map_kills_total';
+  | 'map_kills_total'
+  /** Ambas marcam (futebol): lado A = sim, lado B = não */
+  | 'btts'
+  /** Empate anula (futebol): 2 vias, devolve no empate; só pareia com outro `dnb` */
+  | 'dnb'
+  /**
+   * Resultado de 3 vias que NÃO é a âncora do evento: 1X2 de um período no futebol (`period: 'h1'`)
+   * e resultado no tempo regulamentar de basquete/futebol americano (sem `period`; empate possível
+   * porque a prorrogação não conta). Odds em oddsA (casa) / oddsDraw / oddsB (fora); sempre com
+   * `oddsDraw`, então só o motor de 3 vias o usa. Pareia como o vencedor (troca o lado, sem linha).
+   */
+  | 'result3';
 
 /**
  * Mercado de 2 vias da série. Handicap: `line` é a linha do teamA (ex: −1.5) e o teamB tem −line.
  * Total de mapas: lado A = mais de `line`, lado B = menos de `line`. Só linhas x.5 (sem devolução).
  * Vencedor do mapa: `line` é o número do mapa; lados A/B = teamA/teamB, como no vencedor.
  * Mercados de um mapa (`map_*`): `map` é o número do mapa e `line` segue a regra de handicap/total.
+ *
+ * Esportes tradicionais reusam os mesmos tipos: `winner` = moneyline (no futebol é o 1X2, com
+ * `Quote.oddsDraw`), `handicap` = spread/handicap asiático (pontos, gols, runs, games),
+ * `total` = total de pontos/gols/runs/games. A unidade sai do `Quote.game`.
+ * `period` restringe o mercado a uma parte do jogo; ausente = jogo inteiro.
  */
 export interface MarketSpec {
   type: MarketType;
   line?: number;
   map?: number;
+  /** h1 = 1º tempo, q1 = 1º quarto, set1 = 1º set, i5 = 5 primeiras entradas */
+  period?: 'h1' | 'q1' | 'set1' | 'i5';
 }
 
 /** Nível do livro de ofertas: [preço por share 0..1, quantidade de shares] */
@@ -61,6 +85,13 @@ export interface Quote {
   startTime?: number;
   oddsA: number | null;
   oddsB: number | null;
+  /**
+   * No `winner` de esportes com empate (futebol 1X2) e em todo `result3`. Com ele o mercado é de 3 vias:
+   * o motor de 2 vias ignora o quote e o de 3 vias usa A/empate/B. O quote continua sendo a
+   * âncora do pareamento (`key === eventKey`).
+   */
+  oddsDraw?: number | null;
+  maxStakeDraw?: number;
   /** Liquidez total (moeda da casa) disponível no livro, quando conhecida */
   maxStakeA?: number;
   maxStakeB?: number;
@@ -73,6 +104,8 @@ export interface Quote {
   url: string;
   /** epoch ms da última atualização de preço */
   updatedAt: number;
+  /** Validade própria (ms), no lugar da TTL da casa: ex. pré-jogo buscado com menos frequência */
+  ttlMs?: number;
   /** epoch ms em que odds/suspensão mudaram pela última vez (definido pelo OddsStore) */
   changedAt?: number;
 }
@@ -81,7 +114,7 @@ export interface Leg {
   book: BookId;
   /** Chave do quote e lado apostado (para buscar o histórico) */
   key: string;
-  side: 'A' | 'B';
+  side: 'A' | 'B' | 'D';
   marketId: string;
   selection: string;
   odds: number;
@@ -110,7 +143,8 @@ export interface Opportunity {
   marketLabel: string;
   league?: string;
   startTime?: number;
-  legs: [Leg, Leg];
+  /** 3 pernas só na arbitragem de 3 vias (1X2: time A, empate, time B) */
+  legs: [Leg, Leg] | [Leg, Leg, Leg];
   margin: number;
   profitPct: number;
   status: OpportunityStatus;
@@ -128,7 +162,8 @@ export type ClosedReason = 'odds_moved' | 'stale' | 'unmatched';
 export interface ValueBookOdds {
   book: BookId;
   key: string;
-  side: 'A' | 'B';
+  /** 'D' = empate (EV no 1X2) */
+  side: 'A' | 'B' | 'D';
   odds: number;
   effectiveOdds: number;
   /** Primeira odd vista pelo bot neste mercado (desde que ele entrou no feed) */
