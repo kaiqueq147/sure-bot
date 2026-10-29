@@ -3,6 +3,7 @@ import { backoffDelay, createLogger, sleep } from '../core/logger.js';
 import { detectGame } from '../matching/normalize.js';
 import { Ewma } from '../core/Health.js';
 import { derivedQuoteFields, isHalfLine, isMapNumber, WINNER } from '../core/markets.js';
+import { BROWSER_UA, describeHttpError } from './httpError.js';
 import { NetStats } from './netStats.js';
 import type { BookId, Game, MarketSpec, Quote, Source, SourceStatus } from '../types.js';
 
@@ -236,9 +237,21 @@ export class BetbySource implements Source {
   }
 
   private async get<T>(url: string): Promise<T> {
-    const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+    const res = await fetch(url, {
+      // Cabeçalhos do widget no navegador: sem eles o WAF barra IPs de datacenter (ex.: Railway).
+      headers: {
+        accept: 'application/json',
+        origin: this.opts.siteUrl,
+        referer: `${this.opts.siteUrl}/`,
+        'user-agent': BROWSER_UA,
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
     this.net.record(res.status);
-    if (!res.ok) throw new Error(`HTTP ${res.status} em ${url}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`${describeHttpError(res.status, res.headers, body)} em ${url}`);
+    }
     return (await res.json()) as T;
   }
 
