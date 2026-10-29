@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import type { OddsStore } from "../core/OddsStore.js";
 import { backoffDelay, createLogger, sleep } from "../core/logger.js";
 import { Ewma } from "../core/Health.js";
+import { describeHttpError } from "./httpError.js";
 import { NetStats } from "./netStats.js";
 import { hotEvents } from "../core/hotEvents.js";
 import {
@@ -481,8 +482,12 @@ export class StakeSource implements Source {
     );
 
     this.net.record(res.status);
-    if (res.status === 403 || res.status === 503) {
-      throw new StakeBlockedError(`Cloudflare bloqueou (HTTP ${res.status})`);
+    const html = typeof res.data === "string";
+    if (res.status === 403 || res.status === 503 || html) {
+      const body = res.rawBody?.toString("utf8") ?? "";
+      throw new StakeBlockedError(
+        `bloqueado no cliente TLS: ${describeHttpError(res.status, new Headers(res.headers), body)}`,
+      );
     }
     return res.data as StakeResponse;
   }
@@ -555,9 +560,8 @@ export class StakeSource implements Source {
       const json = (res.headers.get("content-type") ?? "").includes("json");
       this.net.record(res.status);
       if (res.status === 403 || res.status === 503 || !json) {
-        throw new StakeBlockedError(
-          `Cloudflare bloqueou (HTTP ${res.status}${json ? "" : ", página HTML"})`,
-        );
+        const body = await res.text().catch(() => "");
+        throw new StakeBlockedError(describeHttpError(res.status, res.headers, body));
       }
       return (await res.json()) as StakeResponse;
     }
@@ -587,9 +591,8 @@ export class StakeSource implements Source {
     const json = (res.headers.get("content-type") ?? "").includes("json");
     this.net.record(res.status);
     if (res.status === 403 || res.status === 503 || !json) {
-      throw new StakeBlockedError(
-        `Cloudflare bloqueou (HTTP ${res.status}${json ? "" : ", página HTML"})`,
-      );
+      const body = await res.text().catch(() => "");
+      throw new StakeBlockedError(describeHttpError(res.status, res.headers, body));
     }
     return (await res.json()) as StakeResponse;
   }
@@ -694,9 +697,10 @@ export class StakeSource implements Source {
         this.log.warn(`feed falhou (${failures}x)`, err);
         if (blocked || failures >= 3) {
           this.state = "error";
-          this.detail = blocked
-            ? `${(err as Error).message} — tente STAKE_USE_TLS_CLIENT=true`
-            : (err as Error).message;
+          this.detail =
+            blocked && !this.opts.useTlsClient
+              ? `${(err as Error).message} — tente STAKE_USE_TLS_CLIENT=true`
+              : (err as Error).message;
           this.store.setAvailable("stake", false);
         }
         await sleep(

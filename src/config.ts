@@ -124,7 +124,8 @@ export const config = {
       "STAKE_SPORTS",
       "counter-strike,dota-2,league-of-legends,valorant,rainbow-six,overwatch,rocket-league,call-of-duty,starcraft-2,king-of-glory,arena-of-valor,mobile-legends",
     ),
-    useTlsClient: process.env.STAKE_USE_TLS_CLIENT === "true",
+    /** Cliente curl-impersonate (TLS do Chrome): sem ele a Cloudflare barra o fetch do Node */
+    useTlsClient: bool("STAKE_USE_TLS_CLIENT", true),
     /** Uma requisição traz todos os jogos (ao vivo + pré-jogo); nunca abaixo de 1s */
     intervalMs: num("STAKE_INTERVAL_MS", 1_000),
     /** Cookie completo ou só o valor do cf_clearance */
