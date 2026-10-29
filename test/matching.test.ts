@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { matchQuotes } from '../src/matching/matcher.js';
+import { matchQuotes, pairKey, setPairBlocklist } from '../src/matching/matcher.js';
 import { canonicalTeam, detectGame, teamSimilarity } from '../src/matching/normalize.js';
 import type { Quote } from '../src/types.js';
 
@@ -73,4 +73,20 @@ test('modalidades diferentes não pareiam', () => {
     maxStartDiffMs: 1,
   });
   assert.equal(pairs.length, 0);
+});
+
+test('par bloqueado não é pareado; desbloquear volta a parear', () => {
+  const l = [q('stake:1', 'Natus Vincere', 'FaZe', { eventKey: 'stake:1' })];
+  const r = [q('duel:9', 'NAVI', 'FaZe Clan', { book: 'duel', eventKey: 'duel:9' })];
+  const opts = { threshold: 0.78, maxStartDiffMs: 6 * 3600_000 };
+  assert.equal(matchQuotes(l, r, opts).length, 1);
+  const blocked = new Set([pairKey('duel:9', 'stake:1')]);
+  setPairBlocklist((a, b) => blocked.has(pairKey(a, b)));
+  try {
+    assert.equal(matchQuotes(l, r, opts).length, 0, 'par marcado como errado');
+    blocked.clear();
+    assert.equal(matchQuotes(l, r, opts).length, 1);
+  } finally {
+    setPairBlocklist();
+  }
 });

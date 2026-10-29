@@ -20,7 +20,9 @@ export class OddsStore extends EventEmitter {
   }
 
   upsert(quote: Quote): void {
-    const isNew = !this.quotes.has(quote.key);
+    const prev = this.quotes.get(quote.key);
+    quote.changedAt = prev && prev !== quote && samePrice(prev, quote) ? (prev.changedAt ?? prev.updatedAt) : quote.updatedAt;
+    const isNew = !prev;
     this.quotes.set(quote.key, quote);
     if (isNew) this.emit('keys');
     this.emit('update', quote);
@@ -30,6 +32,7 @@ export class OddsStore extends EventEmitter {
     const prev = this.quotes.get(key);
     if (!prev) return undefined;
     const next = { ...prev, ...partial };
+    if (!samePrice(prev, next)) next.changedAt = next.updatedAt;
     this.quotes.set(key, next);
     this.emit('update', next);
     return next;
@@ -76,3 +79,5 @@ export class OddsStore extends EventEmitter {
     return ttl === undefined || now - q.updatedAt <= ttl;
   }
 }
+
+const samePrice = (a: Quote, b: Quote) => a.oddsA === b.oddsA && a.oddsB === b.oddsB && !!a.suspended === !!b.suspended;

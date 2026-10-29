@@ -5,3 +5,5 @@ captures/
 .thunderpick-profile/
 data/
 *.log
+stake-pw-profile/
+_tmp*

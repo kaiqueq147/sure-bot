@@ -163,6 +163,12 @@ body[data-tab='arb'] .ev-only, body[data-tab='ev'] .arb-only { display: none !im
 .ev-table tr.worst td.odd { color: #f2665a; }
 .ev-table td:first-child { white-space: nowrap; }
 .ev-table td.opening { font-size: 12px; color: var(--muted); }
+.ev-table .row-age { display: block; font-size: 11px; color: var(--muted); margin-left: 14px; }
+.ev-table .row-age.stale { color: var(--amber); font-weight: 600; }
+.ev-table td.odd.flash-up { animation: odd-up 1.2s ease-out; }
+.ev-table td.odd.flash-down { animation: odd-down 1.2s ease-out; }
+@keyframes odd-up { 0% { background: rgba(39, 174, 96, 0.45); } 100% { background: transparent; } }
+@keyframes odd-down { 0% { background: rgba(231, 76, 60, 0.45); } 100% { background: transparent; } }
 .ev-table td.opening.up { color: var(--green); }
 .ev-table td.opening.down { color: var(--red); }
 .book-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--book); margin-right: 6px; }
@@ -308,6 +314,11 @@ a.open-both { text-decoration: none; padding: 8px 12px; border-radius: 8px; font
 .exec-note { flex-basis: 100%; margin: 0; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--money); }
 .exec-note .ui { width: 13px; height: 13px; }
 .exec-note.bad { color: var(--amber); }
+.odds-age { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
+.odds-age .ui { width: 12px; height: 12px; }
+.odds-age.stale { color: var(--amber); font-weight: 600; }
+.hist-section { margin: 20px 0 8px; font-size: 15px; }
+.hist-section small { font-weight: 400; font-size: 12px; }
 
 .chart { display: flex; flex-direction: column; gap: 4px; }
 .chart-head { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
@@ -407,3 +418,32 @@ body.compact .ev-best { min-width: 180px; }
 @media (max-width: 900px) {
   body.compact .card { grid-template-columns: 1fr; grid-template-areas: 'head' 'event' 'market' 'body' 'foot'; }
 }
+
+/* Limite de aposta por casa */
+.caps { position: relative; align-self: flex-end; }
+.caps summary {
+  list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px;
+  border-radius: 10px; background: var(--panel-2); border: 1px solid var(--border); font-size: 13px;
+}
+.caps summary::-webkit-details-marker { display: none; }
+.caps-count:not(:empty) { background: var(--money); color: #04130a; border-radius: 999px; padding: 0 6px; font-size: 11px; font-weight: 700; }
+.caps-body {
+  position: absolute; z-index: 20; top: calc(100% + 6px); left: 0; width: 280px; padding: 12px; display: grid; gap: 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+.caps-body small { color: var(--muted); font-size: 12px; }
+.caps-grid { display: grid; grid-template-columns: 1fr 110px; gap: 6px 10px; align-items: center; font-size: 13px; }
+.caps-grid input { width: 100%; }
+.cap-note { flex-basis: 100%; margin: 0; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--amber); }
+.cap-note .ui { width: 13px; height: 13px; }
+
+/* Par errado */
+.wrong-pair { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); font-weight: 600; }
+.wrong-pair:hover { color: var(--red); border-color: var(--red); }
+.ev-table .row-match { display: block; font-size: 11px; color: var(--muted); margin-left: 14px; }
+.ev-table .row-match.low { color: var(--amber); font-weight: 600; }
+.row-wrong { background: none; border: 0; padding: 2px; cursor: pointer; color: var(--muted); }
+.row-wrong:hover { color: var(--red); }
+.row-wrong .ui { width: 15px; height: 15px; }
+.blocked-box { margin-bottom: 16px; }
+.blocked-box button { padding: 4px 10px; font-size: 12px; }

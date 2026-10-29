@@ -110,14 +110,29 @@ export function teamSimilarity(a: string, b: string): number {
   return result;
 }
 
-function computeSimilarity(a: string, b: string): number {
-  const na = normalizeTeam(a);
-  const nb = normalizeTeam(b);
-  const ca = canonicalTeam(a);
-  const cb = canonicalTeam(b);
+interface Prepared {
+  n: string;
+  c: string;
+  tokens: Set<string>;
+}
 
-  const ta = new Set(na.split(' '));
-  const tb = new Set(nb.split(' '));
+/** Cada nome aparece em centenas de comparações: normaliza uma vez só. */
+const preparedCache = new Map<string, Prepared>();
+
+function prepare(name: string): Prepared {
+  let p = preparedCache.get(name);
+  if (!p) {
+    const n = normalizeTeam(name);
+    p = { n, c: canonicalTeam(name), tokens: new Set(n.split(' ')) };
+    if (preparedCache.size > 20_000) preparedCache.clear();
+    preparedCache.set(name, p);
+  }
+  return p;
+}
+
+function computeSimilarity(a: string, b: string): number {
+  const { n: na, c: ca, tokens: ta } = prepare(a);
+  const { n: nb, c: cb, tokens: tb } = prepare(b);
   const distinct = [...ta].some((t) => DISTINGUISHING.has(t) && !tb.has(t)) ||
     [...tb].some((t) => DISTINGUISHING.has(t) && !ta.has(t));
   if (distinct) return 0.4;

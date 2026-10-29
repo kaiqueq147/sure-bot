@@ -5,6 +5,7 @@ import { backoffDelay, createLogger, sleep } from '../core/logger.js';
 import { Ewma } from '../core/Health.js';
 import { derivedQuoteFields, WINNER } from '../core/markets.js';
 import { detectGame } from '../matching/normalize.js';
+import { NetStats } from './netStats.js';
 import type { Game, Quote, Source, SourceStatus } from '../types.js';
 import { extractThunderpick, parseWsFrame, slugify, type LineMarket, type ParsedMatch } from './thunderpickExtract.js';
 
@@ -71,6 +72,7 @@ export class ThunderpickSource implements Source {
   /** chave do quote de vencedor -> ids dos mercados de handicap/total publicados */
   private readonly eventLines = new Map<string, Set<string>>();
   /** Ida e volta do fetch do snapshot feito de dentro da página */
+  private readonly net = new NetStats();
   private readonly latency = new Ewma();
   /** aba -> chamadas de API que trouxeram partidas completas (repetidas no lugar do reload) */
   private readonly snapshotCalls = new WeakMap<Page, SnapshotCall[]>();
@@ -105,6 +107,7 @@ export class ThunderpickSource implements Source {
       lastMessageAt: this.lastDataAt || undefined,
       detail: this.detail,
       latencyMs: this.latency.value,
+      ...this.net.fields(),
     };
   }
 
@@ -478,6 +481,7 @@ export class ThunderpickSource implements Source {
           headers: { accept: 'application/json' },
           signal: AbortSignal.timeout(10_000),
         });
+        this.net.record(res.status);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         this.ingest(await res.json(), this.opts.pageUrls[0] ?? ORIGIN, `poll ${this.opts.apiUrl}`);
         attempt = 0;

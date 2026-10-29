@@ -3,6 +3,7 @@ import { backoffDelay, createLogger, sleep } from '../core/logger.js';
 import { detectGame } from '../matching/normalize.js';
 import { Ewma } from '../core/Health.js';
 import { derivedQuoteFields, isHalfLine, isMapNumber, WINNER } from '../core/markets.js';
+import { NetStats } from './netStats.js';
 import type { BookId, Game, MarketSpec, Quote, Source, SourceStatus } from '../types.js';
 
 /**
@@ -13,7 +14,7 @@ import type { BookId, Game, MarketSpec, Quote, Source, SourceStatus } from '../t
  *  - `GET .../{versãoDoBloco}` -> bloco do snapshot (sports, categories, tournaments, events)
  *  - `GET .../{version + Date.now()}` -> delta com os eventos alterados desde o último tick
  * O snapshot é regenerado a cada ~30s (live) / ~60s (pré-jogo); entre eles o widget busca
- * deltas a cada ~2s. O WebSocket `ws_new` da Betby não envia odds para visitantes anônimos,
+ * deltas a cada ~2s (aqui 1s, com manifesto e delta em paralelo). O WebSocket `ws_new` da Betby não envia odds para visitantes anônimos,
  * então este é o canal mais rápido disponível — o mesmo que o site usa.
  *
  * Mercados seguem os IDs do Sportradar: 186 = "Winner" (2 vias), outcomes 4 = casa, 5 = fora.
@@ -91,6 +92,8 @@ export const BETBY_SPORT_IDS: Record<string, Game> = {
   '201': 'mlbb',
 };
 
+/** Cadência do feed ao vivo quando ele não tem nenhum evento. */
+const IDLE_LIVE_INTERVAL_MS = 5_000;
 const WINNER_MARKET = '186';
 /** Handicap de mapas: specifier `hcp=<linha da casa>`, outcomes 1714 = casa, 1715 = fora */
 const MAP_HANDICAP_MARKET = '327';
@@ -98,6 +101,12 @@ const MAP_HANDICAP_MARKET = '327';
 const TOTAL_MAPS_MARKET = '328';
 /** Vencedor do mapa: specifier `mapnr=<n>`, outcomes 4 = casa, 5 = fora */
 const MAP_WINNER_MARKET = '330';
+/** Handicap de rounds do mapa (CS2/Valorant): `mapnr=<n>|hcp=<linha da casa>`, outcomes 1714/1715 */
+const MAP_ROUNDS_HANDICAP_MARKET = '331';
+/** Total de rounds do mapa (CS2/Valorant): `mapnr=<n>|total=<linha>`, outcomes 12 = mais, 13 = menos */
+const MAP_ROUNDS_TOTAL_MARKET = '332';
+/** Handicap de kills do mapa (LoL/Dota): `mapnr=<n>|hcp=<linha da casa>`, outcomes 1714/1715 */
+const MAP_KILLS_HANDICAP_MARKET = '555';
 
 type TwoWayOdds = { a: number | null; b: number | null; suspended: boolean };
 
@@ -141,6 +150,20 @@ export function lineMarkets(ev: BetbyEvent): Array<TwoWayOdds & { spec: MarketSp
   read(MAP_HANDICAP_MARKET, 'hcp', 'handicap', '1714', '1715', isHalfLine);
   read(TOTAL_MAPS_MARKET, 'total', 'total', '12', '13', isHalfLine);
   read(MAP_WINNER_MARKET, 'mapnr', 'map', '4', '5', isMapNumber);
+
+  // Mercados de um mapa: specifier `mapnr=<n>|hcp=<linha da casa>` ou `mapnr=<n>|total=<linha>`.
+  const readMap = (marketId: string, param: string, type: MarketSpec['type'], outA: string, outB: string) => {
+    for (const [specifier, outcomes] of Object.entries(ev.markets?.[marketId] ?? {})) {
+      const map = Number(/(?:^|\|)mapnr=(\d+)/.exec(specifier)?.[1]);
+      const line = Number(new RegExp(`(?:^|\\|)${param}=(-?[\\d.]+)`).exec(specifier)?.[1]);
+      if (!isMapNumber(map) || !isHalfLine(line)) continue;
+      const odds = pairOdds(outcomes[outA], outcomes[outB]);
+      if (odds) out.push({ ...odds, spec: { type, line, map } });
+    }
+  };
+  readMap(MAP_ROUNDS_HANDICAP_MARKET, 'hcp', 'map_rounds_hcp', '1714', '1715');
+  readMap(MAP_ROUNDS_TOTAL_MARKET, 'total', 'map_rounds_total', '12', '13');
+  readMap(MAP_KILLS_HANDICAP_MARKET, 'hcp', 'map_kills_hcp', '1714', '1715');
   return out;
 }
 
@@ -166,6 +189,7 @@ export class BetbySource implements Source {
   private readonly published = new Map<string, string>();
   /** Ida e volta da requisição de delta */
   private readonly latency = new Ewma();
+  private readonly net = new NetStats();
   /** id do evento -> chaves publicadas (vencedor + handicaps/totais) */
   private readonly eventKeys = new Map<string, Set<string>>();
   private lastOkAt?: number;
@@ -203,6 +227,7 @@ export class BetbySource implements Source {
       lastMessageAt: this.lastOkAt,
       detail: this.detail,
       latencyMs: this.latency.value,
+      ...this.net.fields(),
     };
   }
 
@@ -212,6 +237,7 @@ export class BetbySource implements Source {
 
   private async get<T>(url: string): Promise<T> {
     const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+    this.net.record(res.status);
     if (!res.ok) throw new Error(`HTTP ${res.status} em ${url}`);
     return (await res.json()) as T;
   }
@@ -219,13 +245,21 @@ export class BetbySource implements Source {
   private async runFeed(feed: Feed): Promise<void> {
     let failures = 0;
     while (!this.stopped) {
+      const startedAt = Date.now();
       try {
-        const manifest = await this.get<Manifest>(this.url(feed, 0));
+        // Manifesto e delta saem juntos (uma ida e volta por ciclo em vez de duas).
+        const known = feed.version;
+        let [manifest, delta] = await Promise.all([
+          this.get<Manifest>(this.url(feed, 0)),
+          known === undefined ? undefined : this.get<Chunk>(this.url(feed, known + startedAt)),
+        ]);
+        this.latency.add(Date.now() - startedAt);
         if (manifest.version !== feed.version) await this.loadSnapshot(feed, manifest);
-        const requestedAt = Date.now();
-        const delta = await this.get<Chunk>(this.url(feed, (feed.version ?? manifest.version) + requestedAt));
-        this.latency.add(Date.now() - requestedAt);
-        this.applyDelta(feed, delta);
+        // Primeiro ciclo (ou após falha): ainda não havia versão para pedir o delta junto.
+        delta ??= await this.get<Chunk>(this.url(feed, manifest.version + Date.now()));
+        // Com snapshot novo o delta pedido sobre a versão antiga ainda vale para os eventos que ele traz.
+        if (delta) this.applyDelta(feed, delta);
+        this.touch(feed);
 
         failures = 0;
         this.lastOkAt = Date.now();
@@ -234,7 +268,11 @@ export class BetbySource implements Source {
           this.store.setAvailable(this.opts.book, true);
         }
         this.detail = `${this.feeds.map((f) => `${f.name}: ${f.events.size} eventos`).join(' · ')}`;
-        await sleep(feed.intervalMs);
+        // Cadência fixa: o tempo das requisições é descontado da espera.
+        // Feed ao vivo vazio: desacelera até aparecer jogo (o manifesto passa a trazê-lo).
+        const idle = feed.name === 'live' && feed.events.size === 0;
+        const wait = idle ? Math.max(feed.intervalMs, IDLE_LIVE_INTERVAL_MS) : feed.intervalMs;
+        await sleep(Math.max(0, wait - (Date.now() - startedAt)));
       } catch (err) {
         failures++;
         this.log.warn(`feed ${feed.name} falhou (${failures}x)`, err);
@@ -246,6 +284,20 @@ export class BetbySource implements Source {
           feed.version = undefined;
         }
         await sleep(backoffDelay(failures - 1, feed.intervalMs, 30_000));
+      }
+    }
+  }
+
+  /**
+   * O delta só traz eventos alterados: um ciclo bem-sucedido confirma que as odds dos demais
+   * continuam valendo. Renova `updatedAt` sem emitir update (o preço não mudou).
+   */
+  private touch(feed: Feed): void {
+    const now = Date.now();
+    for (const id of feed.events.keys()) {
+      for (const key of this.eventKeys.get(id) ?? []) {
+        const q = this.store.get(key);
+        if (q) q.updatedAt = now;
       }
     }
   }

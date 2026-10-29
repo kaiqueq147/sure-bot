@@ -2,9 +2,10 @@ import type { OddsStore } from '../core/OddsStore.js';
 import { ReconnectingWebSocket } from '../core/ReconnectingWebSocket.js';
 import { createLogger } from '../core/logger.js';
 import { Ewma } from '../core/Health.js';
-import { derivedQuoteFields, isHalfLine, isMapNumber, WINNER } from '../core/markets.js';
+import { derivedQuoteFields, isHalfLine, isHandicapType, isMapNumber, WINNER } from '../core/markets.js';
 import { depthOdds } from '../engine/math.js';
 import { detectGame } from '../matching/normalize.js';
+import { NetStats } from './netStats.js';
 import type { DepthLevel, Game, MarketSpec, Quote, Source, SourceStatus } from '../types.js';
 
 interface GammaMarket {
@@ -132,6 +133,29 @@ function chunks<T>(list: T[], size = SUBSCRIBE_CHUNK): T[][] {
 }
 
 /**
+ * Tipo de um mercado de linha pelo `sportsMarketType`. Mercados de um mapa trazem o número no
+ * sufixo (`round_handicap_game_2`) ou, nas kills, na pergunta ("... in Game 2?").
+ */
+export function lineMarketKind(m: GammaMarket): { type: MarketSpec['type']; map?: number } | null {
+  const t = m.sportsMarketType ?? '';
+  if (t === 'map_handicap') return { type: 'handicap' };
+  if (t === 'totals') return { type: 'total' };
+  const perMap: Array<[RegExp, MarketSpec['type']]> = [
+    [/^round_handicap_game_(\d+)$/, 'map_rounds_hcp'],
+    [/^round_over_under_game_(\d+)$/, 'map_rounds_total'],
+  ];
+  for (const [re, type] of perMap) {
+    const n = Number(re.exec(t)?.[1]);
+    if (re.test(t)) return isMapNumber(n) ? { type, map: n } : null;
+  }
+  if (t === 'kill_over_under_game') {
+    const n = Number(/\bgame\s*(\d+)/i.exec(`${m.question ?? ''} ${m.groupItemTitle ?? ''}`)?.[1]);
+    return isMapNumber(n) ? { type: 'map_kills_total', map: n } : null;
+  }
+  return null;
+}
+
+/**
  * Handicap e total de mapas da série, orientados pelo vencedor: no handicap a linha da
  * Polymarket vale para o primeiro outcome (que nem sempre é o teamA do vencedor).
  */
@@ -159,12 +183,15 @@ export function pickLineMarkets(
 
     const line = Number(m.line);
     if (!isHalfLine(line)) continue;
-    if (m.sportsMarketType === 'map_handicap') {
-      if (o0 === norm(teamA) && o1 === norm(teamB)) out.push({ market: m, spec: { type: 'handicap', line }, tokenA: tokens[0], tokenB: tokens[1] });
-      else if (o0 === norm(teamB) && o1 === norm(teamA)) out.push({ market: m, spec: { type: 'handicap', line: -line }, tokenA: tokens[1], tokenB: tokens[0] });
-    } else if (m.sportsMarketType === 'totals') {
-      if (o0 === 'over' && o1 === 'under') out.push({ market: m, spec: { type: 'total', line }, tokenA: tokens[0], tokenB: tokens[1] });
-      else if (o0 === 'under' && o1 === 'over') out.push({ market: m, spec: { type: 'total', line }, tokenA: tokens[1], tokenB: tokens[0] });
+    const kind = lineMarketKind(m);
+    if (!kind) continue;
+    const spec = (l: number): MarketSpec => (kind.map ? { type: kind.type, line: l, map: kind.map } : { type: kind.type, line: l });
+    if (isHandicapType(kind.type)) {
+      if (o0 === norm(teamA) && o1 === norm(teamB)) out.push({ market: m, spec: spec(line), tokenA: tokens[0], tokenB: tokens[1] });
+      else if (o0 === norm(teamB) && o1 === norm(teamA)) out.push({ market: m, spec: spec(-line), tokenA: tokens[1], tokenB: tokens[0] });
+    } else {
+      if (o0 === 'over' && o1 === 'under') out.push({ market: m, spec: spec(line), tokenA: tokens[0], tokenB: tokens[1] });
+      else if (o0 === 'under' && o1 === 'over') out.push({ market: m, spec: spec(line), tokenA: tokens[1], tokenB: tokens[0] });
     }
   }
   return out;
@@ -179,6 +206,7 @@ export class PolymarketSource implements Source {
   private discoveryTimer?: NodeJS.Timeout;
   private lastMessageAt?: number;
   /** Chegada da mensagem − carimbo `timestamp` do servidor (inclui diferença de relógio) */
+  private readonly net = new NetStats();
   private readonly latency = new Ewma(0.05);
   private state: SourceStatus['state'] = 'idle';
   private detail?: string;
@@ -219,6 +247,7 @@ export class PolymarketSource implements Source {
       lastMessageAt: this.lastMessageAt,
       detail: this.detail,
       latencyMs: this.latency.value,
+      ...this.net.fields(),
     };
   }
 
@@ -236,6 +265,7 @@ export class PolymarketSource implements Source {
       url.searchParams.set('limit', String(PAGE));
       url.searchParams.set('offset', String(offset));
       const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+      this.net.record(res.status);
       if (!res.ok) throw new Error(`Gamma ${res.status} ${res.statusText}`);
       const page = (await res.json()) as GammaEvent[];
       all.push(...page);
