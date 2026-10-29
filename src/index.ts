@@ -9,6 +9,7 @@ import { OddsStore } from './core/OddsStore.js';
 import { createLogger } from './core/logger.js';
 import { ArbitrageEngine } from './engine/ArbitrageEngine.js';
 import { PolymarketSelfArb } from './engine/PolymarketSelfArb.js';
+import { ThreeWayEngine } from './engine/ThreeWayEngine.js';
 import { ValueScanner } from './engine/ValueScanner.js';
 import { pairKey, setPairBlocklist } from './matching/matcher.js';
 import { startServer } from './server.js';
@@ -84,8 +85,17 @@ for (let i = 0; i < books.length; i++) {
 const selfArb = books.includes('polymarket')
   ? new PolymarketSelfArb(store, { minProfitPct: config.engine.minProfitPct, commissionPct, confirmMs: config.engine.confirmMs })
   : null;
+// 1X2 do futebol: melhor casa/empate/fora entre todas as casas pareadas (3 pernas).
+const threeWay = new ThreeWayEngine(store, () => engines.flatMap((e) => e.matchedPairs()), {
+  minProfitPct: config.engine.minProfitPct,
+  maxProfitPct: config.engine.maxProfitPct,
+  confirmMs: config.engine.confirmMs,
+  frozenMs: config.engine.frozenMs,
+  commissionPct,
+});
 /** Tudo que produz oportunidades de arbitragem (mesmos eventos `opportunity`/`closed`). */
-const arbSources: Array<ArbitrageEngine | PolymarketSelfArb> = selfArb ? [...engines, selfArb] : [...engines];
+const arbSources: Array<ArbitrageEngine | PolymarketSelfArb | ThreeWayEngine> = [...engines, threeWay];
+if (selfArb) arbSources.push(selfArb);
 
 const valueScanner = new ValueScanner(store, () => engines.flatMap((e) => e.matchedPairs()), {
   ...config.ev,
@@ -108,9 +118,18 @@ const rematchAll = () => store.emit('keys');
 const eventKeyOf = (key: string) => store.get(key)?.eventKey ?? key.split(':').slice(0, 2).join(':');
 
 /** Completa cada perna com a hora real do último preço visto/alterado (o motor só copia na emissão). */
+/**
+ * Os dois eventos pareados ("par errado" bloqueia exatamente esse par). No 1X2 de 3 pernas duas
+ * podem estar na mesma casa; com 3 eventos distintos não há um par único e o botão some.
+ */
+const pairEventsOf = (opp: Opportunity): [string, string] | undefined => {
+  const events = [...new Set(opp.legs.map((l) => eventKeyOf(l.key)))];
+  return events.length === 2 ? [events[0], events[1]] : undefined;
+};
+
 const withAges = (opp: Opportunity): Opportunity => ({
   ...opp,
-  pairEvents: [eventKeyOf(opp.legs[0].key), eventKeyOf(opp.legs[1].key)],
+  pairEvents: pairEventsOf(opp),
   legs: opp.legs.map((l) => {
     const q = store.get(l.key);
     return q ? { ...l, updatedAt: Math.max(l.updatedAt, q.updatedAt), changedAt: q.changedAt ?? q.updatedAt } : l;
@@ -147,13 +166,21 @@ const opportunities = (): Opportunity[] =>
     .flatMap((e) => e.list())
     .sort((a, b) => b.profitPct - a.profitPct)
     .map(withAges);
-/** Idade das odds das pernas abertas e das linhas de EV: chave do quote → [visto em, preço mudou em] */
-const legAges = (): Record<string, [number, number]> => {
+/**
+ * Idade das odds: chave do quote → [visto em, preço mudou em]. Com `keys` (as chaves que o
+ * painel tem na tela) só essas; sem, todas as pernas abertas e linhas de EV. Com os esportes
+ * tradicionais são milhares de chaves: mandar tudo a cada 2s pesaria megabytes por minuto.
+ */
+const legAges = (keys?: Iterable<string>): Record<string, [number, number]> => {
   const out: Record<string, [number, number]> = {};
   const add = (key: string) => {
     const q = store.get(key);
     if (q) out[key] = [q.updatedAt, q.changedAt ?? q.updatedAt];
   };
+  if (keys) {
+    for (const k of keys) add(k);
+    return out;
+  }
   for (const e of arbSources) for (const o of e.list()) for (const l of o.legs) add(l.key);
   for (const bet of valueScanner.list()) for (const b of bet.books) add(b.key);
   return out;
@@ -257,11 +284,9 @@ for (const engine of arbSources) {
     const last = logged.get(opp.id);
     if (last && opp.profitPct < last.maxProfit + LOG_STEP_PCT && now - last.at < LOG_REPEAT_MS) return;
     logged.set(opp.id, { maxProfit: Math.max(opp.profitPct, last?.maxProfit ?? -Infinity), at: now });
-    const [a, b] = opp.legs;
-    const market = opp.market.type === 'winner' ? '' : ` [${opp.marketLabel}]`;
-    log.info(
-      `ARB +${opp.profitPct.toFixed(2)}% ${opp.eventName}${market} | ${a.book}: ${a.selection} @ ${a.odds.toFixed(3)} | ${b.book}: ${b.selection} @ ${b.odds.toFixed(3)}`,
-    );
+    const market = opp.market.type === 'winner' && opp.legs.length === 2 ? '' : ` [${opp.marketLabel}]`;
+    const legs = opp.legs.map((l) => `${l.book}: ${l.selection} @ ${l.odds.toFixed(3)}`).join(' | ');
+    log.info(`ARB +${opp.profitPct.toFixed(2)}% ${opp.eventName}${market} | ${legs}`);
   });
   engine.on('closed', (id: string, reason: string) => {
     server.broadcast({ type: 'closed', id, reason });
@@ -310,10 +335,11 @@ valueScanner.on('changed', (raw: ValueBet[]) => {
 });
 valueScanner.start();
 
-setInterval(
-  () => server.broadcast({ type: 'sources', sources: sourceStatus(), health: health.list(), pairs: pairCount(), ages: legAges() }),
-  2_000,
-);
+setInterval(() => {
+  const base = { type: 'sources', sources: sourceStatus(), health: health.list(), pairs: pairCount() };
+  let all: Record<string, [number, number]> | undefined;
+  server.broadcastEach((client) => ({ ...base, ages: client.watch ? legAges(client.watch) : (all ??= legAges()) }));
+}, 2_000);
 
 for (const s of sources) {
   Promise.resolve(s.start()).catch((err) => log.error(`falha ao iniciar ${s.name}`, err));

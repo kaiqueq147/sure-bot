@@ -3,7 +3,9 @@ import type { OddsStore } from '../core/OddsStore.js';
 import { marketLabel } from '../core/markets.js';
 import type { MatchPair } from '../matching/matcher.js';
 import type { BookId, Quote, ValueBet, ValueBookOdds } from '../types.js';
+import { isThreeWay } from './ArbitrageEngine.js';
 import { effectiveOdds, fairProbA, frozenFor } from './math.js';
+import { fairProbs3, margin3, orient, OUTCOMES, outcomeLabel, sideOf, type Outcome } from './threeWay.js';
 
 export interface ValueOptions {
   minEvPct: number;
@@ -73,7 +75,7 @@ export function buildGroups(pairs: readonly MatchPair[], bookOf: (key: string) =
  */
 export class ValueScanner extends EventEmitter {
   private bets = new Map<string, ValueBet>();
-  private readonly opening = new Map<string, { a: number; b: number }>();
+  private readonly opening = new Map<string, { a: number; b: number; d?: number }>();
   private signature = '';
   private timer?: NodeJS.Timeout;
   private scheduled = false;
@@ -112,10 +114,10 @@ export class ValueScanner extends EventEmitter {
     }, 100);
   }
 
-  private trackOpening(q: Quote): { a: number; b: number } {
+  private trackOpening(q: Quote): { a: number; b: number; d?: number } {
     let o = this.opening.get(q.key);
     if (!o) {
-      o = { a: q.oddsA!, b: q.oddsB! };
+      o = { a: q.oddsA!, b: q.oddsB!, d: q.oddsDraw ?? undefined };
       this.opening.set(q.key, o);
     }
     return o;
@@ -127,10 +129,17 @@ export class ValueScanner extends EventEmitter {
     const next = new Map<string, ValueBet>();
     const groups = buildGroups(this.pairs(), (k) => this.store.get(k)?.book);
     for (const g of groups) {
-      const members = g.members
+      const fresh = g.members
         .map((m) => ({ ...m, q: this.store.get(m.key)! }))
         .filter((m) => m.q && this.store.isFresh(m.q, now));
-      for (const m of members) this.trackOpening(m.q);
+      for (const m of fresh) this.trackOpening(m.q);
+      // 1X2 (com empate) não se compara com um mercado de 2 vias: vai para a passada de 3 vias.
+      const threeWay = fresh.filter((m) => isThreeWay(m.q));
+      if (threeWay.length) {
+        this.scanThreeWay(g.id, threeWay, now, next);
+        continue;
+      }
+      const members = fresh;
       if (members.length < 2) continue;
 
       for (const side of ['A', 'B'] as const) {
@@ -171,18 +180,8 @@ export class ValueScanner extends EventEmitter {
         const id = `${g.id}#${side}`;
         const prev = this.bets.get(id);
         const ref = best.q;
-        const warnings: string[] = [];
-        if (evPct > this.opts.warnEvPct) warnings.push('EV anormalmente alto: confira se é o mesmo jogo e se a odd não está congelada.');
         const live = !!ref.startTime && ref.startTime <= now;
-        if (live) warnings.push('Jogo ao vivo: as odds mudam em segundos.');
-        if (others.length === 1) warnings.push('Consenso baseado em uma única casa.');
-        const frozen = frozenFor(ref, rows.slice(1).map((r) => r.q), now, this.opts.frozenMs ?? 30_000);
-        if (frozen !== undefined) {
-          best.row.frozenMs = frozen;
-          warnings.push(`Odd da ${best.row.book} parada há ${Math.round(frozen / 1000)}s com o jogo ao vivo: pode estar congelada.`);
-        }
-        if (best.row.maxStake != null && best.row.maxStake < 50)
-          warnings.push(`Pouca liquidez na melhor odd ($${best.row.maxStake.toFixed(2)}).`);
+        const warnings = this.warnings(evPct, best, rows.slice(1).map((r) => r.q), others.length, live, now);
 
         const minOdds = Math.min(...rows.map((r) => r.row.odds));
         next.set(id, {
@@ -190,7 +189,7 @@ export class ValueScanner extends EventEmitter {
           game: ref.game,
           eventName: ref.eventName,
           market: ref.market,
-          marketLabel: marketLabel(ref.market),
+          marketLabel: marketLabel(ref.market, ref.game),
           league: ref.league,
           startTime: ref.startTime,
           live,
@@ -215,6 +214,107 @@ export class ValueScanner extends EventEmitter {
     if (sig !== this.signature) {
       this.signature = sig;
       this.emit('changed', this.list());
+    }
+  }
+
+  /** Avisos comuns de uma aposta de valor; marca `frozenMs` na melhor linha quando congelada. */
+  private warnings(
+    evPct: number,
+    best: { q: Quote; row: ValueBookOdds },
+    peers: Quote[],
+    consensus: number,
+    live: boolean,
+    now: number,
+  ): string[] {
+    const warnings: string[] = [];
+    if (evPct > this.opts.warnEvPct) warnings.push('EV anormalmente alto: confira se é o mesmo jogo e se a odd não está congelada.');
+    if (live) warnings.push('Jogo ao vivo: as odds mudam em segundos.');
+    if (consensus === 1) warnings.push('Consenso baseado em uma única casa.');
+    const frozen = frozenFor(best.q, peers, now, this.opts.frozenMs ?? 30_000);
+    if (frozen !== undefined) {
+      best.row.frozenMs = frozen;
+      warnings.push(`Odd da ${best.row.book} parada há ${Math.round(frozen / 1000)}s com o jogo ao vivo: pode estar congelada.`);
+    }
+    if (best.row.maxStake != null && best.row.maxStake < 50)
+      warnings.push(`Pouca liquidez na melhor odd ($${best.row.maxStake.toFixed(2)}).`);
+    return warnings;
+  }
+
+  /**
+   * EV no 1X2: para cada resultado, a melhor odd contra a probabilidade justa das outras casas
+   * (margem das três seleções removida proporcionalmente em cada casa).
+   */
+  private scanThreeWay(
+    groupId: string,
+    fresh: Array<{ key: string; flip: boolean; q: Quote }>,
+    now: number,
+    next: Map<string, ValueBet>,
+  ): void {
+    const members = fresh.flatMap((m) => {
+      const odds = orient(m.q, m.flip);
+      return odds ? [{ ...m, odds }] : [];
+    });
+    if (members.length < 2) return;
+    const ref = (members.find((m) => !m.flip) ?? members[0]).q;
+    const live = !!ref.startTime && ref.startTime <= now;
+
+    for (const outcome of OUTCOMES) {
+      const rows = members.map(({ q, flip, odds }): { q: Quote; row: ValueBookOdds } => {
+        const side = sideOf(outcome, flip);
+        const open = this.opening.get(q.key);
+        const overroundPct = (margin3(odds.home, odds.draw, odds.away) - 1) * 100;
+        return {
+          q,
+          row: {
+            book: q.book,
+            key: q.key,
+            side,
+            odds: odds[outcome],
+            effectiveOdds: effectiveOdds(q, odds[outcome], this.opts.commissionPct),
+            openingOdds: side === 'A' ? open?.a : side === 'B' ? open?.b : open?.d,
+            fairProb: fairProbs3(odds)[outcome],
+            overroundPct,
+            inConsensus: overroundPct <= this.opts.maxOverroundPct,
+            maxStake: side === 'A' ? q.maxStakeA : side === 'B' ? q.maxStakeB : q.maxStakeDraw,
+            url: q.url,
+            updatedAt: q.updatedAt,
+          },
+        };
+      });
+      rows.sort((a, b) => b.row.effectiveOdds - a.row.effectiveOdds);
+      const best = rows[0];
+      const others = rows.slice(1).filter((r) => r.row.inConsensus);
+      if (!others.length || others.length < (this.opts.minConsensusBooks ?? 2)) continue;
+      const fairProb = others.reduce((sum, r) => sum + r.row.fairProb, 0) / others.length;
+      const evPct = (best.row.effectiveOdds * fairProb - 1) * 100;
+      if (evPct < this.opts.minEvPct) continue;
+
+      const id = `${groupId}#${outcome === 'home' ? 'A' : outcome === 'away' ? 'B' : 'D'}`;
+      const warnings = this.warnings(evPct, best, rows.slice(1).map((r) => r.q), others.length, live, now);
+      const opponent: Outcome = outcome === 'home' ? 'away' : 'home';
+      const minOdds = Math.min(...rows.map((r) => r.row.odds));
+      next.set(id, {
+        id,
+        game: ref.game,
+        eventName: ref.eventName,
+        market: ref.market,
+        marketLabel: marketLabel(ref.market, ref.game),
+        league: ref.league,
+        startTime: ref.startTime,
+        live,
+        selection: outcomeLabel(outcome, ref),
+        opponent: outcome === 'draw' ? `${ref.teamA} x ${ref.teamB}` : outcomeLabel(opponent, ref),
+        books: rows.map((r) => r.row),
+        bestBook: best.row.book,
+        fairProb,
+        fairOdds: 1 / fairProb,
+        evPct,
+        disparityPct: (best.row.odds / minOdds - 1) * 100,
+        oddsDiff: best.row.odds - minOdds,
+        firstSeen: this.bets.get(id)?.firstSeen ?? now,
+        updatedAt: now,
+        warnings,
+      });
     }
   }
 }

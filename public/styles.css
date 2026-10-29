@@ -114,8 +114,24 @@ main { padding: 20px; }
 .card { border-left: 4px solid var(--g, var(--border)); }
 
 body[data-tab='arb'] .ev-only, body[data-tab='ev'] .arb-only { display: none !important; }
+body:not([data-sports='1']) .sports-only { display: none !important; }
+
+/* Aba Esportes: escolhe entre a arbitragem e o EV dos esportes tradicionais */
+.subtabs { display: flex; gap: 6px; padding: 10px 20px 0; }
+.subtab {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px;
+  font-size: 13px; font-weight: 600; color: var(--muted); background: var(--panel-2); border: 1px solid var(--border);
+}
+.subtab.active { color: var(--text); border-color: var(--money); }
+.subtab .count { font-size: 11px; font-weight: 700; color: var(--text); }
+
+/* Cards além da página atual (ver "mostrar mais") */
+.feed > .beyond { display: none !important; }
+.more { display: block; margin: 16px auto 0; padding: 8px 16px; font-weight: 600; }
 
 .tabs { display: flex; gap: 4px; padding: 0 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+/* Com a aba Esportes as quatro abas não cabem no celular: a barra rola, a página não. */
+@media (max-width: 600px) { .tabs { padding: 0 8px; overflow-x: auto; } .tab { flex: none; padding: 12px 10px; } }
 .tab {
   display: inline-flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 0;
   padding: 12px 16px; font-size: 14px; font-weight: 600; color: var(--muted); border-bottom: 2px solid transparent;
@@ -219,7 +235,12 @@ a.open-both { text-decoration: none; padding: 8px 12px; border-radius: 8px; font
 .sub { margin: 0; color: var(--muted); font-size: 12px; }
 
 .legs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-@media (max-width: 480px) { .legs { grid-template-columns: 1fr; } }
+/* 1X2: time A, empate, time B. Três pernas não cabem num card de 420px: ocupa duas colunas. */
+.legs.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (min-width: 900px) { .feed > .card:has(.legs.three) { grid-column: span 2; } }
+@media (max-width: 899px) { .legs.three { grid-template-columns: 1fr; } }
+@media (max-width: 480px) { .legs, .legs.three { grid-template-columns: 1fr; } }
+.leg[hidden] { display: none; }
 .leg {
   background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px;
   display: flex; flex-direction: column; gap: 6px; border-top: 3px solid var(--book, var(--border));
@@ -427,8 +448,10 @@ body.compact .ev-best { min-width: 180px; }
 }
 .caps summary::-webkit-details-marker { display: none; }
 .caps-count:not(:empty) { background: var(--money); color: #04130a; border-radius: 999px; padding: 0 6px; font-size: 11px; font-weight: 700; }
+/* Fechado não pode ocupar espaço: no celular o popover de 280px empurrava a página para o lado. */
+.caps:not([open]) .caps-body { display: none; }
 .caps-body {
-  position: absolute; z-index: 20; top: calc(100% + 6px); left: 0; width: 280px; padding: 12px; display: grid; gap: 10px;
+  position: absolute; z-index: 20; top: calc(100% + 6px); left: 0; width: min(280px, calc(100vw - 32px)); padding: 12px; display: grid; gap: 10px;
   background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
 }
 .caps-body small { color: var(--muted); font-size: 12px; }

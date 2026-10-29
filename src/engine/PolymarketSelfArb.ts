@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import type { OddsStore } from '../core/OddsStore.js';
 import { marketLabel } from '../core/markets.js';
 import type { BookId, ClosedReason, DepthLevel, Leg, Opportunity, Quote } from '../types.js';
+import { isThreeWay } from './ArbitrageEngine.js';
 import { arbMargin, effectiveOdds, profitPct } from './math.js';
 
 export interface SelfArbOptions {
@@ -103,6 +104,8 @@ export class PolymarketSelfArb extends EventEmitter {
     const alive = new Set<string>();
     for (const q of this.store.byBook('polymarket')) {
       if (!this.store.isFresh(q, now)) continue;
+      // 1X2 (futebol): casa + fora não cobrem o empate, então não é arbitragem.
+      if (isThreeWay(q)) continue;
       const legs: [Leg, Leg] = [this.leg(q, 'A'), this.leg(q, 'B')];
       const margin = arbMargin(legs[0].effectiveOdds, legs[1].effectiveOdds);
       if (margin >= 1) continue;

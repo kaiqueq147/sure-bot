@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Sure-Bot · Arbitragem eSports</title>
+    <title>Sure-Bot · Arbitragem eSports e esportes</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -12,7 +12,7 @@
         <span class="logo"><i class="ui" style="--icon: url(/icons/ui/banknote.svg)"></i></span>
         <div>
           <h1>Sure-Bot</h1>
-          <small>Polymarket × Thunderpick × Duel × Cloudbet × Stake · eSports</small>
+          <small>Polymarket × Thunderpick × Duel × Cloudbet × Stake · eSports e esportes</small>
         </div>
       </div>
       <div class="status" id="status">
@@ -92,9 +92,16 @@
       <button type="button" class="tab" data-tab="ev">
         <i class="ui" style="--icon: url(/icons/ui/sparkles.svg)"></i>EV+<span class="count" id="ev-count">0</span>
       </button>
+      <button type="button" class="tab" data-tab="sports">
+        <i class="ui" style="--icon: url(/icons/soccer.svg)"></i>Esportes<span class="count" id="sports-count">0</span>
+      </button>
       <button type="button" class="tab" data-tab="hist">
         <i class="ui" style="--icon: url(/icons/ui/history.svg)"></i>Histórico
       </button>
+    </nav>
+    <nav class="subtabs sports-only" id="sport-views" aria-label="Arbitragem ou EV nos esportes">
+      <button type="button" class="subtab" data-view="arb"><i class="ui" style="--icon: url(/icons/ui/scale.svg)"></i>Arbitragem<span class="count" id="sports-arb-count">0</span></button>
+      <button type="button" class="subtab" data-view="ev"><i class="ui" style="--icon: url(/icons/ui/sparkles.svg)"></i>EV+<span class="count" id="sports-ev-count">0</span></button>
     </nav>
     <nav class="chips live-only" id="game-chips" aria-label="Filtrar por modalidade"></nav>
 
@@ -105,6 +112,7 @@
           <small>Os cards aparecem aqui assim que a soma das probabilidades implícitas ficar abaixo de 100%.</small>
         </div>
         <div id="feed" class="feed"></div>
+        <button type="button" class="more" id="arb-more" data-kind="arb" hidden></button>
       </section>
       <section id="tab-ev" hidden>
        
@@ -113,6 +121,7 @@
           <small>Precisa do mesmo jogo pareado em pelo menos duas casas.</small>
         </div>
         <div id="ev-feed" class="feed"></div>
+        <button type="button" class="more" id="ev-more" data-kind="ev" hidden></button>
       </section>
       <section id="tab-hist" hidden>
         <div class="hist-box blocked-box" id="blocked-box" hidden>
@@ -196,6 +205,20 @@
             <div class="liq"><i class="ui" style="--icon: url(/icons/ui/droplets.svg)"></i><span class="liq-text"></span></div>
             <a class="open" target="_blank" rel="noopener noreferrer"><span class="open-text"></span><i class="ui" style="--icon: url(/icons/ui/external-link.svg)"></i></a>
           </div>
+          <div class="leg" data-i="2" hidden>
+            <div class="leg-head"><span class="book"></span><span class="pick-label">Aposta em</span></div>
+            <div class="odds-age"><i class="ui" style="--icon: url(/icons/ui/clock.svg)"></i><span class="odds-age-text"></span></div>
+            <div class="selection"></div>
+            <div class="odds-box"><span class="odds-label">Odd</span><span class="odds"></span><i class="ui trend"></i><span class="prob"></span></div>
+            <div class="eff"></div>
+            <div class="stake-row">
+              <span><i class="ui" style="--icon: url(/icons/ui/coins.svg)"></i>Apostar</span>
+              <strong class="stake money"></strong>
+            </div>
+            <div class="row-sub"><span>Retorno se ganhar</span><span class="leg-return money-soft"></span></div>
+            <div class="liq"><i class="ui" style="--icon: url(/icons/ui/droplets.svg)"></i><span class="liq-text"></span></div>
+            <a class="open" target="_blank" rel="noopener noreferrer"><span class="open-text"></span><i class="ui" style="--icon: url(/icons/ui/external-link.svg)"></i></a>
+          </div>
         </div>
         <div class="calc">
           <span class="calc-bank"><i class="ui" style="--icon: url(/icons/ui/wallet.svg)"></i>Banca <strong class="bank-value money"></strong></span>
@@ -216,7 +239,7 @@
           <div class="card-actions">
             <button type="button" class="take"><i class="ui" style="--icon: url(/icons/ui/circle-check.svg)"></i><span class="take-text">Fiz esta</span></button>
             <button type="button" class="wrong-pair" title="Os dois eventos não são o mesmo jogo: o bot deixa de pareá-los"><i class="ui" style="--icon: url(/icons/ui/circle-x.svg)"></i><span>Par errado</span></button>
-            <button type="button" class="open-both"><i class="ui" style="--icon: url(/icons/ui/layers.svg)"></i>Abrir as duas casas</button>
+            <button type="button" class="open-both"><i class="ui" style="--icon: url(/icons/ui/layers.svg)"></i><span class="open-both-text">Abrir as duas casas</span></button>
           </div>
         </footer>
       </article>

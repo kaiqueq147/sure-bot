@@ -14,6 +14,9 @@ ENV NODE_OPTIONS=--enable-source-maps
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 RUN npx playwright install --with-deps chromium && rm -rf /var/lib/apt/lists/*
+# Binário do curl-impersonate (cliente TLS da Stake) baixado no build: se não rodar nesta imagem,
+# o build falha aqui em vez de a Stake ficar bloqueada em produção.
+RUN node -e "import('cuimp').then(async (m) => { const b = await m.downloadBinary({ descriptor: { browser: 'chrome', version: 'latest' } }); console.log(b.binaryPath); require('child_process').execFileSync(b.binaryPath, ['--version'], { stdio: 'inherit' }); })"
 COPY --from=build /app/dist ./dist
 COPY public ./public
 ENV PORT=3000

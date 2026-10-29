@@ -5,6 +5,7 @@ import { backoffDelay, createLogger, sleep } from '../core/logger.js';
 import { Ewma } from '../core/Health.js';
 import { derivedQuoteFields, isHalfLine, isMapNumber, WINNER } from '../core/markets.js';
 import { NetStats } from './netStats.js';
+import { PERIOD_SAFE, PROPS_SAFE } from './betby.js';
 import type { Game, MarketSpec, Quote, Source, SourceStatus } from '../types.js';
 
 /**
@@ -46,7 +47,11 @@ interface CloudbetResponse {
   sports?: Array<{ key: string; competitions?: Array<{ key: string; name: string; events?: CloudbetEvent[] }> }>;
 }
 
+/** Lista de onde o evento veio: cada busca só poda os eventos da própria lista. */
+type Scope = 'esports' | 'sports';
+
 interface Tracked {
+  scope: Scope;
   sport: string;
   competitionKey: string;
   competitionName: string;
@@ -64,6 +69,12 @@ export interface CloudbetOptions {
   sports: string[];
   liveIntervalMs: number;
   allIntervalMs: number;
+  /** Esportes tradicionais (chaves da Cloudbet); vazio = desligado */
+  traditionalSports?: string[];
+  /** A cada quanto uma volta busca os esportes tradicionais ao vivo */
+  sportsLiveIntervalMs?: number;
+  /** A cada quanto uma volta busca todos os jogos dos esportes tradicionais */
+  sportsAllIntervalMs?: number;
 }
 
 /** Chave de esporte da Cloudbet -> modalidade */
@@ -82,6 +93,53 @@ export const CLOUDBET_SPORTS: Record<string, Game> = {
 };
 
 const MARKETS = ['winner', 'map_handicap', 'total_maps', 'map_winner'];
+
+/** Chave de esporte da Cloudbet -> esporte tradicional (aba "Esportes") */
+export const CLOUDBET_TRADITIONAL_SPORTS: Record<string, Game> = {
+  soccer: 'soccer',
+  basketball: 'basketball',
+  baseball: 'baseball',
+  tennis: 'tennis',
+  'american-football': 'american_football',
+};
+
+/**
+ * Mercados da Feed API da Cloudbet por esporte (sem o prefixo `<esporte>.`). Seleções: home/away,
+ * draw no 1X2, over/under nos totais, yes/no no ambas marcam; linha em `params`
+ * (`handicap=-1.5`, `total=2.5`). Todas as linhas alternativas vêm no mesmo mercado.
+ */
+interface SportMarketKeys {
+  winner?: string;
+  winner3?: string;
+  hcp: string;
+  tot: string;
+}
+const TRADITIONAL_MARKETS: Record<string, SportMarketKeys> = {
+  soccer: { winner3: 'match_odds', hcp: 'asian_handicap', tot: 'total_goals' },
+  basketball: { winner: 'moneyline', hcp: 'handicap', tot: 'totals' },
+  'american-football': { winner: 'moneyline', hcp: 'handicap', tot: 'totals' },
+  baseball: { winner: 'moneyline', hcp: 'run_line', tot: 'totals' },
+  tennis: { winner: 'winner', hcp: 'game_handicap', tot: 'total_games' },
+};
+const SOCCER_H1: SportMarketKeys = {
+  winner3: 'match_odds_period_first_half',
+  hcp: 'asian_handicap_period_first_half',
+  tot: 'total_goals_period_first_half',
+};
+const SOCCER_BTTS = 'both_teams_to_score';
+const SOCCER_DNB = 'draw_no_bet';
+
+/** Mercados pedidos na URL para um esporte tradicional. */
+function traditionalMarketKeys(sport: string): string[] {
+  const m = TRADITIONAL_MARKETS[sport];
+  if (!m) return [];
+  const keys = [m.winner, m.winner3, m.hcp, m.tot];
+  if (sport === 'soccer') {
+    if (PERIOD_SAFE) keys.push(SOCCER_H1.winner3, SOCCER_H1.hcp, SOCCER_H1.tot);
+    if (PROPS_SAFE) keys.push(SOCCER_BTTS, SOCCER_DNB);
+  }
+  return keys.filter((k): k is string => !!k);
+}
 /** Um evento some do store se nenhum dos dois ciclos o trouxer por este tempo. */
 const FORGET_MS = 60_000;
 /** Cadência do ciclo ao vivo quando não há nenhum jogo ao vivo. */
@@ -111,6 +169,7 @@ export async function retryAfterSecs(res: Response): Promise<number> {
 }
 
 type TwoWayOdds = { a: number | null; b: number | null; suspended: boolean; maxA?: number; maxB?: number };
+export type CloudbetOdds = TwoWayOdds & { spec: MarketSpec; draw?: number | null; maxDraw?: number };
 
 const param = (params: string, name: string): number => Number(new RegExp(`(?:^|&)${name}=(-?[\\d.]+)`).exec(params)?.[1]);
 
@@ -163,6 +222,74 @@ export function cloudbetMarkets(sport: string, ev: CloudbetEvent): Array<TwoWayO
   return out;
 }
 
+/**
+ * Mercados dos esportes tradicionais: vencedor (1X2 com empate no futebol), handicap e total com
+ * qualquer linha x.5 e, quando o núcleo já os distingue, 1º tempo, ambas marcam e empate anula.
+ */
+export function cloudbetSportMarkets(sport: string, ev: CloudbetEvent): CloudbetOdds[] {
+  const keys = TRADITIONAL_MARKETS[sport];
+  if (!keys) return [];
+  const prefix = sport.replace(/-/g, '_');
+  const out: CloudbetOdds[] = [];
+  const selections = (market: string) =>
+    Object.values(ev.markets?.[`${prefix}.${market}`]?.submarkets ?? {}).flatMap((s) => s.selections ?? []);
+  const byParams = (sels: CloudbetSelection[]) => {
+    const m = new Map<string, CloudbetSelection[]>();
+    for (const s of sels) m.set(s.params, [...(m.get(s.params) ?? []), s]);
+    return m;
+  };
+  const find = (sels: CloudbetSelection[], outcome: string) => sels.find((s) => s.outcome === outcome);
+  const lines = (market: string, name: string, type: MarketSpec['type'], a: string, b: string, period?: MarketSpec['period']) => {
+    for (const [params, sels] of byParams(selections(market))) {
+      const line = param(params, name);
+      if (!isHalfLine(line)) continue;
+      const odds = pairOdds(find(sels, a), find(sels, b));
+      if (odds) out.push({ ...odds, spec: period ? { type, line, period } : { type, line } });
+    }
+  };
+  const block = (m: SportMarketKeys, period?: MarketSpec['period']) => {
+    const spec: MarketSpec = period ? { type: 'winner', period } : WINNER;
+    if (m.winner3) {
+      const sels = selections(m.winner3);
+      const two = pairOdds(find(sels, 'home'), find(sels, 'away'));
+      const d = find(sels, 'draw');
+      if (two && d) {
+        const draw = Number.isFinite(d.price) && d.price > 1 ? d.price : null;
+        out.push({
+          ...two,
+          draw,
+          maxDraw: d.maxStake,
+          suspended: two.suspended || d.status !== 'SELECTION_ENABLED' || draw === null,
+          spec,
+        });
+      }
+    } else if (m.winner) {
+      const sels = selections(m.winner);
+      // Moneyline com empate (tempo regulamentar) não é de 2 vias: não dá para cobrir com duas apostas.
+      if (!sels.some((s) => s.outcome === 'draw')) {
+        const odds = pairOdds(find(sels, 'home'), find(sels, 'away'));
+        if (odds) out.push({ ...odds, spec });
+      }
+    }
+    lines(m.hcp, 'handicap', 'handicap', 'home', 'away', period);
+    lines(m.tot, 'total', 'total', 'over', 'under', period);
+  };
+
+  block(keys);
+  if (sport === 'soccer') {
+    if (PERIOD_SAFE) block(SOCCER_H1, 'h1');
+    if (PROPS_SAFE) {
+      const btts = selections(SOCCER_BTTS);
+      const b = pairOdds(find(btts, 'yes'), find(btts, 'no'));
+      if (b) out.push({ ...b, spec: { type: 'btts' } });
+      const dnb = selections(SOCCER_DNB);
+      const d = pairOdds(find(dnb, 'home'), find(dnb, 'away'));
+      if (d) out.push({ ...d, spec: { type: 'dnb' } });
+    }
+  }
+  return out;
+}
+
 export class CloudbetSource implements Source {
   readonly name = 'cloudbet';
   private stopped = true;
@@ -178,6 +305,8 @@ export class CloudbetSource implements Source {
   /** Multiplicador do intervalo: sobe a cada 429 e recua a cada resposta OK */
   private slowdown = 1;
   private lastFullAt = 0;
+  private lastSportsLiveAt = 0;
+  private lastSportsAllAt = 0;
   private lastOkAt?: number;
   private state: SourceStatus['state'] = 'idle';
   private detail?: string;
@@ -211,16 +340,18 @@ export class CloudbetSource implements Source {
     };
   }
 
-  private url(live: boolean): string {
+  private url(live: boolean, scope: Scope = 'esports'): string {
     const u = new URL(`${this.opts.apiBase}/sports/events`);
     u.searchParams.set('limit', '999');
     u.searchParams.set('locale', this.opts.lang);
     u.searchParams.set('include-all-event-types', 'false');
     // Sem `live` vêm todos os jogos (ao vivo e pré-jogo).
     if (live) u.searchParams.set('live', 'true');
-    for (const s of this.opts.sports) {
+    const sports = scope === 'esports' ? this.opts.sports : (this.opts.traditionalSports ?? []);
+    for (const s of sports) {
       u.searchParams.append('sports', s);
-      for (const m of MARKETS) u.searchParams.append('markets', `${s.replace(/-/g, '_')}.${m}`);
+      const markets = scope === 'esports' ? MARKETS : traditionalMarketKeys(s);
+      for (const m of markets) u.searchParams.append('markets', `${s.replace(/-/g, '_')}.${m}`);
     }
     return u.toString();
   }
@@ -261,20 +392,37 @@ export class CloudbetSource implements Source {
   }
 
   /**
+   * O que buscar nesta volta (uma requisição por volta, sempre). Os esportes tradicionais entram
+   * no mesmo ciclo, em cadência própria, sem aumentar o número de requisições: ganham a vez de
+   * uma volta que seria só dos eSports ao vivo.
+   */
+  private nextTask(now: number): { scope: Scope; full: boolean } {
+    const sports = (this.opts.traditionalSports ?? []).length > 0;
+    if (sports && now - this.lastSportsAllAt >= (this.opts.sportsAllIntervalMs ?? 60_000)) return { scope: 'sports', full: true };
+    if (now - this.lastFullAt >= this.opts.allIntervalMs) return { scope: 'esports', full: true };
+    if (sports && now - this.lastSportsLiveAt >= (this.opts.sportsLiveIntervalMs ?? 5_000)) return { scope: 'sports', full: false };
+    return { scope: 'esports', full: false };
+  }
+
+  /**
    * Ciclo único: nunca há duas requisições em voo. A lista completa sai a cada `allIntervalMs`,
    * nas demais voltas só o ao vivo. O tempo da requisição é descontado da espera.
    */
   private async loop(): Promise<void> {
-    const liveUrl = this.url(true);
-    const allUrl = this.url(false);
+    const urls: Record<string, string> = {
+      'esports:live': this.url(true, 'esports'),
+      'esports:all': this.url(false, 'esports'),
+      'sports:live': this.url(true, 'sports'),
+      'sports:all': this.url(false, 'sports'),
+    };
     let failures = 0;
     while (!this.stopped) {
       await this.waitCooldown();
       if (this.stopped) break;
       const startedAt = Date.now();
-      const full = startedAt - this.lastFullAt >= this.opts.allIntervalMs;
+      const { scope, full } = this.nextTask(startedAt);
       try {
-        const res = await fetch(full ? allUrl : liveUrl, {
+        const res = await fetch(urls[`${scope}:${full ? 'all' : 'live'}`], {
           headers: { accept: 'application/json' },
           signal: AbortSignal.timeout(15_000),
         });
@@ -290,8 +438,11 @@ export class CloudbetSource implements Source {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = (await res.json()) as CloudbetResponse;
         this.latency.add(Date.now() - startedAt);
-        this.ingest(body, !full);
-        if (full) this.lastFullAt = startedAt;
+        this.ingest(body, !full, scope);
+        if (scope === 'sports') {
+          this.lastSportsLiveAt = startedAt;
+          if (full) this.lastSportsAllAt = startedAt;
+        } else if (full) this.lastFullAt = startedAt;
 
         failures = 0;
         this.slowdown = Math.max(1, this.slowdown * SLOWDOWN_DECAY);
@@ -308,7 +459,7 @@ export class CloudbetSource implements Source {
         await sleep(Math.max(0, jitter(base * this.slowdown) - (Date.now() - startedAt)));
       } catch (err) {
         failures++;
-        this.log.warn(`feed ${full ? 'geral' : 'ao vivo'} falhou (${failures}x)`, err);
+        this.log.warn(`feed ${scope} ${full ? 'geral' : 'ao vivo'} falhou (${failures}x)`, err);
         if (failures >= 3) {
           this.state = 'error';
           this.detail = (err as Error).message;
@@ -319,11 +470,12 @@ export class CloudbetSource implements Source {
     }
   }
 
-  private ingest(body: CloudbetResponse, live: boolean): void {
+  private ingest(body: CloudbetResponse, live: boolean, scope: Scope = 'esports'): void {
     const now = Date.now();
     const seen = new Set<string>();
+    const known = scope === 'esports' ? CLOUDBET_SPORTS : CLOUDBET_TRADITIONAL_SPORTS;
     for (const sport of body.sports ?? []) {
-      if (!CLOUDBET_SPORTS[sport.key]) continue;
+      if (!known[sport.key]) continue;
       for (const comp of sport.competitions ?? []) {
         for (const ev of comp.events ?? []) {
           if (ev.type && ev.type !== 'EVENT_TYPE_EVENT') continue;
@@ -332,13 +484,14 @@ export class CloudbetSource implements Source {
           const prev = this.events.get(id);
           // O ciclo ao vivo é mais recente: o geral não sobrescreve um evento que o ao vivo acabou de trazer.
           if (!live && prev?.live && now - prev.seenAt < this.opts.allIntervalMs) continue;
-          this.events.set(id, { sport: sport.key, competitionKey: comp.key, competitionName: comp.name, ev, live, seenAt: now });
+          this.events.set(id, { scope, sport: sport.key, competitionKey: comp.key, competitionName: comp.name, ev, live, seenAt: now });
           this.sync(id);
         }
       }
     }
     for (const [id, t] of this.events) {
-      if (seen.has(id)) continue;
+      // Cada busca só responde pelos eventos da própria lista (eSports x esportes tradicionais).
+      if (seen.has(id) || t.scope !== scope) continue;
       // Saiu do ao vivo (acabou ou ainda está no geral): marca como não-ao-vivo para o geral assumir.
       if (live && t.live) t.live = false;
       if (now - t.seenAt > FORGET_MS || (!live && !t.live)) {
@@ -354,13 +507,14 @@ export class CloudbetSource implements Source {
     const ev = t?.ev;
     const keys = new Set<string>();
     if (t && ev?.home?.name && ev.away?.name) {
-      const game = CLOUDBET_SPORTS[t.sport];
+      const game = t.scope === 'esports' ? CLOUDBET_SPORTS[t.sport] : CLOUDBET_TRADITIONAL_SPORTS[t.sport];
       const tradable = ev.status === 'TRADING' || ev.status === 'TRADING_LIVE';
-      for (const odds of cloudbetMarkets(t.sport, ev)) {
-        const fields = derivedQuoteFields(eventKey, odds.spec, ev.home.name, ev.away.name);
+      const markets: CloudbetOdds[] = t.scope === 'esports' ? cloudbetMarkets(t.sport, ev) : cloudbetSportMarkets(t.sport, ev);
+      for (const odds of markets) {
+        const fields = derivedQuoteFields(eventKey, odds.spec, ev.home.name, ev.away.name, game);
         keys.add(fields.key);
         const suspended = odds.suspended || !tradable;
-        const sig = `${odds.a}|${odds.b}|${suspended}|${odds.maxA}|${odds.maxB}`;
+        const sig = `${odds.a}|${odds.b}|${odds.draw}|${suspended}|${odds.maxA}|${odds.maxB}`;
         const prev = this.store.get(fields.key);
         // Sem mudança só renova o carimbo (mantém o quote "fresco" sem disparar reavaliações).
         if (this.published.get(fields.key) === sig && prev) {
@@ -375,6 +529,7 @@ export class CloudbetSource implements Source {
           oddsB: odds.b,
           maxStakeA: odds.maxA,
           maxStakeB: odds.maxB,
+          ...(odds.draw !== undefined ? { oddsDraw: odds.draw, maxStakeDraw: odds.maxDraw } : {}),
           suspended,
         });
       }
@@ -404,7 +559,7 @@ export class CloudbetSource implements Source {
       teamA: home,
       teamB: away,
       startTime: Number.isFinite(start) ? start : undefined,
-      url: `${this.opts.siteUrl}/${this.opts.lang}/esports/${t.sport}/${comp}/${ev.id}`,
+      url: `${this.opts.siteUrl}/${this.opts.lang}/${t.scope === 'esports' ? 'esports' : 'sports'}/${t.sport}/${comp}/${ev.id}`,
       updatedAt: Date.now(),
     };
   }

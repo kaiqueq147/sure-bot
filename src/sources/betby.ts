@@ -2,7 +2,9 @@ import type { OddsStore } from '../core/OddsStore.js';
 import { backoffDelay, createLogger, sleep } from '../core/logger.js';
 import { detectGame } from '../matching/normalize.js';
 import { Ewma } from '../core/Health.js';
-import { derivedQuoteFields, isHalfLine, isMapNumber, WINNER } from '../core/markets.js';
+import { derivedQuoteFields, isHalfLine, isMapNumber, marketKey, sameMarket, WINNER } from '../core/markets.js';
+import { isSport } from '../core/sports.js';
+import { BROWSER_UA, describeHttpError } from './httpError.js';
 import { NetStats } from './netStats.js';
 import type { BookId, Game, MarketSpec, Quote, Source, SourceStatus } from '../types.js';
 
@@ -92,6 +94,62 @@ export const BETBY_SPORT_IDS: Record<string, Game> = {
   '201': 'mlbb',
 };
 
+/** sport_id da Betby -> esporte tradicional (aba "Esportes") */
+export const BETBY_TRADITIONAL_SPORT_IDS: Record<string, Game> = {
+  '1': 'soccer',
+  '2': 'basketball',
+  '3': 'baseball',
+  '5': 'tennis',
+  '16': 'american_football',
+};
+
+/**
+ * Mercados Sportradar dos esportes tradicionais. Basquete, futebol americano e beisebol usam as
+ * versões "incluindo prorrogação/entradas extras" (219/223/225, 251/256/258): as de tempo
+ * regulamentar (1/16/18) têm outra regra e não podem ser cruzadas com as das outras casas.
+ * Tênis: handicap/total de games (187/189); os de sets (188/314) têm outra unidade e ficam de fora.
+ */
+interface SportMarketIds {
+  /** 2 vias, outcomes 4/5 */
+  winner?: string;
+  /** 3 vias (1X2), outcomes 1 = casa, 2 = empate, 3 = fora */
+  winner3?: string;
+  /** `hcp=<linha da casa>`, outcomes 1714/1715 */
+  hcp: string;
+  /** `total=<linha>`, outcomes 12 = mais, 13 = menos */
+  tot: string;
+}
+const SPORT_MARKETS: Partial<Record<Game, SportMarketIds>> = {
+  soccer: { winner3: '1', hcp: '16', tot: '18' },
+  basketball: { winner: '219', hcp: '223', tot: '225' },
+  american_football: { winner: '219', hcp: '223', tot: '225' },
+  baseball: { winner: '251', hcp: '256', tot: '258' },
+  tennis: { winner: '186', hcp: '187', tot: '189' },
+};
+/** 1º tempo do futebol: 1X2 (60), handicap (66), total (68) */
+const SOCCER_H1: SportMarketIds = { winner3: '60', hcp: '66', tot: '68' };
+/** Ambas marcam: outcomes 74 = sim, 76 = não */
+const BTTS_MARKET = '29';
+/** Empate anula: outcomes 4 = casa, 5 = fora */
+const DNB_MARKET = '11';
+/** Vencedor do set (`setnr=<n>`), outcomes 4/5 */
+const TENNIS_SET_WINNER_MARKET = '202';
+
+/**
+ * Mercados com `period`, `btts` e `dnb` só saem quando o núcleo (markets.ts) já os distingue na
+ * chave e no pareamento; senão um total do 1º tempo cruzaria com o do jogo inteiro (e btts com
+ * dnb), gerando arbitragem falsa. Checado uma vez, liga sozinho quando o núcleo der suporte.
+ */
+export const PERIOD_SAFE =
+  marketKey({ type: 'total', line: 1.5, period: 'h1' }) !== marketKey({ type: 'total', line: 1.5 }) &&
+  !sameMarket({ type: 'total', line: 1.5, period: 'h1' }, { type: 'total', line: 1.5 }) &&
+  // O vencedor usa a própria eventKey como chave: o de um período precisa de outra.
+  derivedQuoteFields('e', { type: 'winner', period: 'set1' }, 'a', 'b').key !== 'e';
+export const PROPS_SAFE =
+  marketKey({ type: 'btts' }) !== marketKey({ type: 'dnb' }) &&
+  marketKey({ type: 'btts' }) !== 'win' &&
+  marketKey({ type: 'dnb' }) !== 'win';
+
 /** Cadência do feed ao vivo quando ele não tem nenhum evento. */
 const IDLE_LIVE_INTERVAL_MS = 5_000;
 const WINNER_MARKET = '186';
@@ -167,6 +225,75 @@ export function lineMarkets(ev: BetbyEvent): Array<TwoWayOdds & { spec: MarketSp
   return out;
 }
 
+export type SportOdds = TwoWayOdds & { spec: MarketSpec; draw?: number | null };
+
+/** 1X2: outcomes 1 = casa, 2 = empate, 3 = fora. */
+function threeWay(m?: Record<string, BetbyOutcome>): SportOdds | null {
+  const x = m?.['1'];
+  const d = m?.['2'];
+  const y = m?.['3'];
+  if (!x || !d || !y) return null;
+  const two = pairOdds(x, y)!;
+  const k = Number(d.k);
+  const draw = Number.isFinite(k) && k > 1 ? k : null;
+  return { ...two, draw, suspended: two.suspended || d.b === 1 || draw === null, spec: WINNER };
+}
+
+/**
+ * Mercados dos esportes tradicionais: vencedor (1X2 com empate no futebol), handicap/spread e
+ * total com qualquer linha x.5 (as linhas alternativas vêm todas no mesmo mercado) e, quando o
+ * núcleo já os distingue, 1º tempo, ambas marcam, empate anula e vencedor do 1º set.
+ */
+export function sportMarkets(ev: BetbyEvent, game: Game): SportOdds[] {
+  const ids = SPORT_MARKETS[game];
+  if (!ids) return [];
+  const out: SportOdds[] = [];
+  const first = (marketId?: string) => {
+    const variants = marketId ? ev.markets?.[marketId] : undefined;
+    return variants?.[''] ?? (variants ? Object.values(variants)[0] : undefined);
+  };
+  const lines = (marketId: string, param: string, type: MarketSpec['type'], outA: string, outB: string, period?: MarketSpec['period']) => {
+    for (const [specifier, outcomes] of Object.entries(ev.markets?.[marketId] ?? {})) {
+      const line = Number(new RegExp(`(?:^|\\|)${param}=(-?[\\d.]+)`).exec(specifier)?.[1]);
+      if (!isHalfLine(line)) continue;
+      const odds = pairOdds(outcomes[outA], outcomes[outB]);
+      if (odds) out.push({ ...odds, spec: period ? { type, line, period } : { type, line } });
+    }
+  };
+  const block = (m: SportMarketIds, period?: MarketSpec['period']) => {
+    const spec: MarketSpec = period ? { type: 'winner', period } : WINNER;
+    if (m.winner3) {
+      const w = threeWay(first(m.winner3));
+      if (w) out.push({ ...w, spec });
+    } else if (m.winner) {
+      const w = first(m.winner);
+      const odds = w ? pairOdds(w['4'], w['5']) : null;
+      if (odds) out.push({ ...odds, spec });
+    }
+    lines(m.hcp, 'hcp', 'handicap', '1714', '1715', period);
+    lines(m.tot, 'total', 'total', '12', '13', period);
+  };
+
+  block(ids);
+  if (game === 'soccer') {
+    if (PERIOD_SAFE) block(SOCCER_H1, 'h1');
+    if (PROPS_SAFE) {
+      const btts = first(BTTS_MARKET);
+      const b = btts ? pairOdds(btts['74'], btts['76']) : null;
+      if (b) out.push({ ...b, spec: { type: 'btts' } });
+      const dnb = first(DNB_MARKET);
+      const d = dnb ? pairOdds(dnb['4'], dnb['5']) : null;
+      if (d) out.push({ ...d, spec: { type: 'dnb' } });
+    }
+  }
+  if (game === 'tennis' && PERIOD_SAFE) {
+    const set1 = ev.markets?.[TENNIS_SET_WINNER_MARKET]?.['setnr=1'];
+    const odds = set1 ? pairOdds(set1['4'], set1['5']) : null;
+    if (odds) out.push({ ...odds, spec: { type: 'winner', period: 'set1' } });
+  }
+  return out;
+}
+
 /** Deltas trazem só os campos alterados; mercados presentes substituem os anteriores. */
 export function mergeEvent(prev: BetbyEvent | undefined, delta: BetbyEvent): BetbyEvent {
   if (!prev) return delta;
@@ -236,9 +363,21 @@ export class BetbySource implements Source {
   }
 
   private async get<T>(url: string): Promise<T> {
-    const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+    const res = await fetch(url, {
+      // Cabeçalhos do widget no navegador: sem eles o WAF barra IPs de datacenter (ex.: Railway).
+      headers: {
+        accept: 'application/json',
+        origin: this.opts.siteUrl,
+        referer: `${this.opts.siteUrl}/`,
+        'user-agent': BROWSER_UA,
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
     this.net.record(res.status);
-    if (!res.ok) throw new Error(`HTTP ${res.status} em ${url}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`${describeHttpError(res.status, res.headers, body)} em ${url}`);
+    }
     return (await res.json()) as T;
   }
 
@@ -343,7 +482,7 @@ export class BetbySource implements Source {
 
   private gameOf(ev: BetbyEvent): Game | null {
     if (!ev.desc || ev.desc.virtual || ev.desc.type !== 'match' || ev.desc.competitors?.length !== 2) return null;
-    const byId = BETBY_SPORT_IDS[ev.desc.sport];
+    const byId = BETBY_SPORT_IDS[ev.desc.sport] ?? BETBY_TRADITIONAL_SPORT_IDS[ev.desc.sport];
     if (byId) return byId;
     const g = detectGame(this.sports.get(ev.desc.sport)?.slug);
     return g === 'other' ? null : g;
@@ -354,8 +493,10 @@ export class BetbySource implements Source {
     const eventKey = `${this.opts.book}:${id}`;
     const ev = this.feeds[0].events.get(id) ?? this.feeds[1].events.get(id);
     const game = ev ? this.gameOf(ev) : null;
-    const markets: Array<TwoWayOdds & { spec: MarketSpec }> = [];
-    if (ev && game) {
+    const markets: SportOdds[] = [];
+    if (ev && game && isSport(game)) {
+      markets.push(...sportMarkets(ev, game));
+    } else if (ev && game) {
       const winner = winnerOdds(ev);
       if (winner) markets.push({ ...winner, spec: WINNER });
       markets.push(...lineMarkets(ev));
@@ -365,12 +506,19 @@ export class BetbySource implements Source {
     const desc = ev?.desc;
     for (const odds of markets) {
       const [home, away] = desc!.competitors;
-      const fields = derivedQuoteFields(eventKey, odds.spec, home.name, away.name);
+      const fields = derivedQuoteFields(eventKey, odds.spec, home.name, away.name, game ?? undefined);
       keys.add(fields.key);
-      const sig = `${odds.a}|${odds.b}|${odds.suspended}`;
+      const sig = `${odds.a}|${odds.b}|${odds.draw}|${odds.suspended}`;
       if (this.published.get(fields.key) === sig) continue;
       this.published.set(fields.key, sig);
-      this.store.upsert({ ...this.baseQuote(id, ev!, game!), ...fields, oddsA: odds.a, oddsB: odds.b, suspended: odds.suspended });
+      this.store.upsert({
+        ...this.baseQuote(id, ev!, game!),
+        ...fields,
+        oddsA: odds.a,
+        oddsB: odds.b,
+        ...(odds.draw !== undefined ? { oddsDraw: odds.draw } : {}),
+        suspended: odds.suspended,
+      });
     }
     for (const key of this.eventKeys.get(id) ?? []) {
       if (keys.has(key)) continue;

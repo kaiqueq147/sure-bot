@@ -51,6 +51,10 @@ export const config = {
     minFillUsd: num("POLYMARKET_MIN_FILL_USD", 10),
     /** Níveis do livro enviados ao dashboard para o cálculo de lucro pela banca */
     depthLevels: num("POLYMARKET_DEPTH_LEVELS", 15),
+    /** Tags do Gamma com jogos de esportes tradicionais (aba "Esportes"); vazio desliga */
+    sportTagSlugs: list("POLYMARKET_SPORT_TAG_SLUGS", "soccer,basketball,baseball,tennis,nfl"),
+    /** Só jogos de esportes tradicionais que começam dentro desta janela (horas) */
+    sportsHorizonH: num("POLYMARKET_SPORTS_HORIZON_H", 48),
   },
 
   thunderpick: {
@@ -106,6 +110,18 @@ export const config = {
     liveIntervalMs: num("CLOUDBET_LIVE_INTERVAL_MS", 1_500),
     /** A cada quanto uma das voltas busca todos os jogos (pré-jogo muda pouco e pesa mais) */
     allIntervalMs: num("CLOUDBET_ALL_INTERVAL_MS", 15_000),
+    /** Esportes tradicionais (aba "Esportes"); vazio desliga. Dividem o mesmo ciclo dos eSports. */
+    traditionalSports: list(
+      "CLOUDBET_TRADITIONAL_SPORTS",
+      "soccer,basketball,baseball,tennis,american-football",
+    ),
+    /** A cada quanto uma volta busca os esportes tradicionais ao vivo */
+    sportsLiveIntervalMs: num("CLOUDBET_SPORTS_LIVE_INTERVAL_MS", 5_000),
+    /**
+     * A cada quanto uma volta busca todos os jogos dos esportes tradicionais. Precisa ficar
+     * abaixo de CLOUDBET_STALE_MS, senão o pré-jogo envelhece entre uma busca e outra.
+     */
+    sportsAllIntervalMs: num("CLOUDBET_SPORTS_ALL_INTERVAL_MS", 15_000),
     /** Pausa pedida pela Cloudflare num 429, preservada entre reinícios */
     cooldownFile: env(
       "CLOUDBET_COOLDOWN_FILE",
@@ -124,7 +140,8 @@ export const config = {
       "STAKE_SPORTS",
       "counter-strike,dota-2,league-of-legends,valorant,rainbow-six,overwatch,rocket-league,call-of-duty,starcraft-2,king-of-glory,arena-of-valor,mobile-legends",
     ),
-    useTlsClient: process.env.STAKE_USE_TLS_CLIENT === "true",
+    /** Cliente curl-impersonate (TLS do Chrome): sem ele a Cloudflare barra o fetch do Node */
+    useTlsClient: bool("STAKE_USE_TLS_CLIENT", true),
     /** Uma requisição traz todos os jogos (ao vivo + pré-jogo); nunca abaixo de 1s */
     intervalMs: num("STAKE_INTERVAL_MS", 1_000),
     /** Cookie completo ou só o valor do cf_clearance */
@@ -141,6 +158,13 @@ export const config = {
     usePlaywright: process.env.STAKE_USE_PLAYWRIGHT === "true",
     staleMs: num("STAKE_STALE_MS", 20_000),
     commissionPct: num("STAKE_COMMISSION_PCT", 0),
+    /** Esportes tradicionais (slugs da Stake), em ciclo próprio; vazio desliga */
+    tradSports: list("STAKE_TRAD_SPORTS", "soccer,basketball,baseball,tennis,american-football"),
+    tradLiveIntervalMs: num("STAKE_TRAD_LIVE_INTERVAL_MS", 3_000),
+    tradPrematchIntervalMs: num("STAKE_TRAD_PREMATCH_INTERVAL_MS", 60_000),
+    /** Máximo de jogos de pré-jogo por esporte (páginas de 50) */
+    tradPrematchMax: num("STAKE_TRAD_PREMATCH_MAX", 150),
+    tradHorizonH: num("STAKE_TRAD_HORIZON_H", 48),
   },
 
   db: {
