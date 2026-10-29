@@ -63,10 +63,10 @@ const state = {
   minProfit: Number(localStorage.getItem('minProfit')) || 0,
   game: 'all',
   onlyConfirmed: false,
-  /** Aba do topo: arb | ev (eSports), sports (esportes tradicionais) ou hist */
-  tab: ['ev', 'hist', 'sports'].includes(localStorage.getItem('tab')) ? localStorage.getItem('tab') : 'arb',
-  /** Dentro da aba Esportes: arbitragem ou EV */
-  sportsView: localStorage.getItem('sportsView') === 'ev' ? 'ev' : 'arb',
+  /** Categoria: esports ou sports (esportes tradicionais); cada uma tem as mesmas abas */
+  universe: savedUniverse(),
+  /** Aba: arb | ev | hist */
+  tab: savedTab(),
   /** Cards renderizados por lista (o resto fica atrás do "mostrar mais") */
   limit: { arb: 60, ev: 60 },
   taken: new Set(),
@@ -87,10 +87,22 @@ const state = {
   blocked: [],
 };
 
-/** O que a tela mostra agora: arb | ev | hist (a aba Esportes reaproveita as listas de arb e EV). */
-const view = () => (state.tab === 'sports' ? state.sportsView : state.tab);
-/** O item pertence à aba atual? eSports nas abas Arbitragem/EV+, esportes na aba Esportes. */
-const inCategory = (game) => isSport(game) === (state.tab === 'sports');
+/** O que a tela mostra agora: arb | ev | hist. */
+const view = () => state.tab;
+/** O item pertence à categoria escolhida (eSports ou esportes)? */
+const inCategory = (game) => isSport(game) === (state.universe === 'sports');
+
+/** Versões antigas guardavam a aba "sports" + sportsView; migra para categoria + aba. */
+function savedUniverse() {
+  const u = localStorage.getItem('universe');
+  if (u === 'sports' || u === 'esports') return u;
+  return localStorage.getItem('tab') === 'sports' ? 'sports' : 'esports';
+}
+function savedTab() {
+  const t = localStorage.getItem('tab');
+  if (t === 'sports') return localStorage.getItem('sportsView') === 'ev' ? 'ev' : 'arb';
+  return t === 'ev' || t === 'hist' ? t : 'arb';
+}
 /** Cards por "página" de cada lista. */
 const PAGE = 60;
 
@@ -1102,12 +1114,12 @@ function setTab(tab) {
   localStorage.setItem('tab', tab);
   const v = view();
   document.body.dataset.tab = v;
-  document.body.dataset.sports = tab === 'sports' ? '1' : '0';
+  document.body.dataset.universe = state.universe;
+  for (const b of document.querySelectorAll('.uni')) b.setAttribute('aria-pressed', String(b.dataset.universe === state.universe));
   $('#tab-arb').hidden = v !== 'arb';
   $('#tab-ev').hidden = v !== 'ev';
   $('#tab-hist').hidden = v !== 'hist';
   for (const b of document.querySelectorAll('.tab')) b.classList.toggle('active', b.dataset.tab === tab);
-  for (const b of document.querySelectorAll('.subtab')) b.classList.toggle('active', b.dataset.view === state.sportsView);
   // Chip de modalidade da outra categoria não existe aqui.
   if (state.game !== 'all' && !inCategory(state.game)) state.game = 'all';
   state.limit = { arb: PAGE, ev: PAGE };
@@ -1196,11 +1208,11 @@ function renderCounts() {
   }
   $('#empty').hidden = arbShown > 0;
   $('#ev-empty').hidden = evShown > 0;
-  $('#arb-count').textContent = n.arb[0];
-  $('#ev-count').textContent = n.ev[0];
+  const u = state.universe === 'sports' ? 1 : 0;
+  $('#arb-count').textContent = n.arb[u];
+  $('#ev-count').textContent = n.ev[u];
+  $('#esports-count').textContent = n.arb[0] + n.ev[0];
   $('#sports-count').textContent = n.arb[1] + n.ev[1];
-  $('#sports-arb-count').textContent = n.arb[1];
-  $('#sports-ev-count').textContent = n.ev[1];
   renderChips();
 }
 
@@ -1525,12 +1537,12 @@ function initControls() {
     const tab = e.target.closest('.tab');
     if (tab) setTab(tab.dataset.tab);
   });
-  $('#sport-views').addEventListener('click', (e) => {
-    const sub = e.target.closest('.subtab');
-    if (!sub) return;
-    state.sportsView = sub.dataset.view;
-    localStorage.setItem('sportsView', state.sportsView);
-    setTab('sports');
+  $('#universe').addEventListener('click', (e) => {
+    const uni = e.target.closest('.uni');
+    if (!uni || uni.dataset.universe === state.universe) return;
+    state.universe = uni.dataset.universe;
+    localStorage.setItem('universe', state.universe);
+    setTab(state.tab === 'hist' ? 'arb' : state.tab);
   });
   for (const more of document.querySelectorAll('.more')) {
     more.addEventListener('click', () => {

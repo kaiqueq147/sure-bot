@@ -33,6 +33,29 @@
       <small>Latência: Polymarket = atraso das mensagens em relação ao carimbo do servidor; Duel = ida e volta do delta; Cloudbet e Stake = ida e volta do feed; Thunderpick = fetch do snapshot dentro da página. Uptime e quedas contam desde a primeira conexão. Bloqueios/min = respostas 403 · 429 no último minuto; se ficar acima de 0, aumente o intervalo de consulta da casa (ex.: <code>STAKE_INTERVAL_MS</code>).</small>
     </section>
 
+    <nav class="universe" id="universe" aria-label="Categoria">
+      <button type="button" class="uni" data-universe="esports">
+        <i class="ui uni-icon" style="--icon: url(/icons/ui/gamepad-2.svg)"></i>
+        <span class="uni-text"><strong>eSports</strong><small>CS2 · LoL · Dota 2 · Valorant e mais</small></span>
+        <span class="count" id="esports-count">0</span>
+      </button>
+      <button type="button" class="uni" data-universe="sports">
+        <i class="ui uni-icon" style="--icon: url(/icons/soccer.svg)"></i>
+        <span class="uni-text"><strong>Esportes</strong><small>Futebol · Basquete · Tênis · Beisebol · NFL</small></span>
+        <span class="count" id="sports-count">0</span>
+      </button>
+    </nav>
+    <nav class="tabs" id="tabs">
+      <button type="button" class="tab active" data-tab="arb">
+        <i class="ui" style="--icon: url(/icons/ui/scale.svg)"></i>Arbitragem<span class="count" id="arb-count">0</span>
+      </button>
+      <button type="button" class="tab" data-tab="ev">
+        <i class="ui" style="--icon: url(/icons/ui/sparkles.svg)"></i>EV+<span class="count" id="ev-count">0</span>
+      </button>
+      <button type="button" class="tab" data-tab="hist">
+        <i class="ui" style="--icon: url(/icons/ui/history.svg)"></i>Histórico
+      </button>
+    </nav>
     <section class="controls">
       <label class="money-input">
         <span><i class="ui" style="--icon: url(/icons/ui/wallet.svg)"></i>Banca padrão</span>
@@ -85,24 +108,6 @@
       <button id="notify-btn" type="button"><i class="ui" style="--icon: url(/icons/ui/bell.svg)"></i><span>Ativar notificações</span></button>
       <span class="meta" id="meta"></span>
     </section>
-    <nav class="tabs" id="tabs">
-      <button type="button" class="tab active" data-tab="arb">
-        <i class="ui" style="--icon: url(/icons/ui/scale.svg)"></i>Arbitragem<span class="count" id="arb-count">0</span>
-      </button>
-      <button type="button" class="tab" data-tab="ev">
-        <i class="ui" style="--icon: url(/icons/ui/sparkles.svg)"></i>EV+<span class="count" id="ev-count">0</span>
-      </button>
-      <button type="button" class="tab" data-tab="sports">
-        <i class="ui" style="--icon: url(/icons/soccer.svg)"></i>Esportes<span class="count" id="sports-count">0</span>
-      </button>
-      <button type="button" class="tab" data-tab="hist">
-        <i class="ui" style="--icon: url(/icons/ui/history.svg)"></i>Histórico
-      </button>
-    </nav>
-    <nav class="subtabs sports-only" id="sport-views" aria-label="Arbitragem ou EV nos esportes">
-      <button type="button" class="subtab" data-view="arb"><i class="ui" style="--icon: url(/icons/ui/scale.svg)"></i>Arbitragem<span class="count" id="sports-arb-count">0</span></button>
-      <button type="button" class="subtab" data-view="ev"><i class="ui" style="--icon: url(/icons/ui/sparkles.svg)"></i>EV+<span class="count" id="sports-ev-count">0</span></button>
-    </nav>
     <nav class="chips live-only" id="game-chips" aria-label="Filtrar por modalidade"></nav>
 
     <main>
