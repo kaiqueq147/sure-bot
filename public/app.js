@@ -2,6 +2,8 @@ const BOOKS = {
   polymarket: { label: 'Polymarket', color: '#2d6cf6' },
   thunderpick: { label: 'Thunderpick', color: '#a855f7' },
   duel: { label: 'Duel', color: '#f97316' },
+  cloudbet: { label: 'Cloudbet', color: '#10b981' },
+  stake: { label: 'Stake', color: '#1475e1' },
   simulator: { label: 'Simulador', color: '#64748b' },
 };
 const BOOK_LABEL = Object.fromEntries(Object.entries(BOOKS).map(([k, v]) => [k, v.label]));
@@ -57,9 +59,28 @@ const state = {
   ev: new Map(), // id -> { bet, el }
   minEv: Number(localStorage.getItem('minEv') || 0),
   minDiff: Number(localStorage.getItem('minDiff') ?? 0.3),
+  /** Teto para a menor odd entre as casas na aba EV (0 = sem limite): descarta azarões */
+  maxBaseOdds: Number(localStorage.getItem('maxBaseOdds') ?? 4),
+  /** Teto para a maior odd entre as casas na aba EV (0 = sem limite) */
+  maxTopOdds: Number(localStorage.getItem('maxTopOdds') ?? 0),
   onlyPrematch: false,
   sound: localStorage.getItem('sound') === '1',
+  /** Idade das odds das pernas: chave do quote → [visto em, preço mudou em] */
+  ages: {},
+  /** Aposta máxima aceita por casa (casa → $); casa ausente = sem limite */
+  bookCaps: readCaps(),
+  /** Pares marcados como "par errado" (vindos do servidor) */
+  blocked: [],
 };
+
+function readCaps() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('bookCaps') ?? '{}');
+    return Object.fromEntries(Object.entries(raw).filter(([, v]) => Number(v) > 0).map(([k, v]) => [k, Number(v)]));
+  } catch {
+    return {};
+  }
+}
 
 // ------------------------------------------------------------------ cálculos
 
@@ -133,6 +154,32 @@ function maxBankroll(opp) {
   return lo;
 }
 
+/**
+ * Plano respeitando o limite de aposta de cada casa: se uma perna passa do máximo, a banca
+ * inteira encolhe na mesma proporção (as duas pernas continuam cobrindo o mesmo retorno).
+ */
+function planCapped(opp, bankroll) {
+  let used = bankroll;
+  let plan = planArb(opp, used);
+  const limited = new Set();
+  // Com livro (Polymarket) a odd depende da stake: algumas voltas para convergir.
+  for (let i = 0; i < 4; i++) {
+    let f = 1;
+    opp.legs.forEach((leg, j) => {
+      const cap = state.bookCaps[leg.book];
+      const stake = j === 0 ? plan.s1 : plan.s2;
+      if (cap && stake > cap + 0.005) {
+        f = Math.min(f, cap / stake);
+        limited.add(leg.book);
+      }
+    });
+    if (f >= 1) break;
+    used *= f;
+    plan = planArb(opp, used);
+  }
+  return { ...plan, bankroll: used, capped: used < bankroll - 0.005, limited: [...limited] };
+}
+
 // ------------------------------------------------------------------ websocket
 
 let ws;
@@ -170,6 +217,7 @@ function handle(msg) {
       const ids = new Set(msg.opportunities.map((o) => o.id));
       for (const [id, entry] of state.opps) if (!ids.has(id)) removeCard(id, entry);
       state.taken = new Set(msg.taken ?? []);
+      renderBlocked(msg.blocked ?? []);
       msg.opportunities.forEach(upsert);
       renderEv(msg.ev ?? [], { silent: true });
       renderSources(msg.sources, msg.pairs);
@@ -178,6 +226,11 @@ function handle(msg) {
     }
     case 'ev':
       renderEv(msg.items);
+      break;
+    case 'ev-delta':
+      msg.remove.forEach(removeEv);
+      msg.upsert.forEach((bet) => upsertEv(bet));
+      updateEmpty();
       break;
     case 'opportunity':
       upsert(msg.opportunity);
@@ -188,10 +241,14 @@ function handle(msg) {
     case 'taken':
       markLocalTaken(msg.id);
       break;
+    case 'blocked':
+      renderBlocked(msg.items);
+      break;
     case 'taken-cleared':
       clearLocalTaken();
       break;
     case 'sources':
+      if (msg.ages) state.ages = msg.ages;
       renderSources(msg.sources, msg.pairs);
       renderHealth(msg.health);
       break;
@@ -258,6 +315,11 @@ function renderHealth(list) {
     st.className = `health-state ${kind}`;
     st.textContent = STATE_LABEL[h.state] ?? h.state;
     const lat = h.latencyMs == null ? '—' : h.latencyMs < 1000 ? `${Math.round(h.latencyMs)} ms` : `${(h.latencyMs / 1000).toFixed(1).replace('.', ',')} s`;
+    const blocked = h.blockedPerMin ?? null;
+    const limited = h.rateLimitedPerMin ?? null;
+    const throttled = (blocked ?? 0) + (limited ?? 0) > 0;
+    if (throttled && worst === 'ok') worst = 'warn';
+    const blockCell = blocked == null && limited == null ? '—' : `${blocked ?? 0} · ${limited ?? 0}`;
     return row([
       book,
       st,
@@ -267,7 +329,8 @@ function renderHealth(list) {
       [lat, `num${h.latencyMs > 3000 ? ' warn' : ''}`],
       [`${h.uptimePct.toFixed(1).replace('.', ',')}%`, `num${h.uptimePct < 95 ? ' warn' : ''}`],
       [h.disconnects ? `${h.disconnects} (última há ${fmtAge(now - h.lastDisconnectAt)})` : '0', 'num'],
-      [h.detail ?? '', 'detail'],
+      [blockCell, `num${throttled ? ' warn' : ''}`],
+      [throttled ? `${h.detail ? `${h.detail} · ` : ''}bloqueios/rate limit: aumente o intervalo de consulta` : (h.detail ?? ''), 'detail'],
     ]);
   });
   $('#health-panel tbody').replaceChildren(...rows);
@@ -318,7 +381,7 @@ function renderReport(r) {
   $('#h-arb-bank').textContent = r.count ? fmtMoney(r.totalBankroll) : '—';
 
   groupTable($('#h-by-game'), r.byGame, (k) => gameMeta(k).label);
-  groupTable($('#h-by-books'), r.byBooks, (k) => k.split('×').map((b) => BOOK_LABEL[b] ?? b).join(' × '));
+  groupTable($('#h-by-books'), r.byBooks, booksLabel);
   groupTable($('#h-by-market'), r.byMarket, (k) => k);
 
   const max = Math.max(1, ...r.byHour);
@@ -334,6 +397,8 @@ function renderReport(r) {
       return bar;
     }),
   );
+
+  renderDetected(r.detected);
 
   const arbHead = document.createElement('tr');
   arbHead.innerHTML = '<th>Quando</th><th>Jogo</th><th>Mercado</th><th>Pernas</th><th class="num">Banca</th><th class="num">Lucro</th>';
@@ -352,6 +417,49 @@ function renderReport(r) {
           ]);
         })
       : [row([['Nenhuma arbitragem marcada como feita neste período', 'muted']])]),
+  );
+}
+
+const DURATION_LABELS = ['Menos de 5s', '5 a 30s', '30s a 2min', '2 a 10min', 'Mais de 10min'];
+const fmtDuration = (ms) => (ms == null ? '—' : ms < 1000 ? `${Math.round(ms)} ms` : fmtAge(ms));
+const booksLabel = (k) => k.split('×').map((b) => BOOK_LABEL[b] ?? b).join(' × ');
+
+function renderDetected(d) {
+  if (!d) return;
+  $('#h-det-count').textContent = d.count;
+  $('#h-det-closed').textContent = d.count ? `${d.closed} já fecharam` : 'nada detectado neste período';
+  $('#h-det-avg').textContent = d.count ? pct(d.avgProfitPct, 2) : '—';
+  $('#h-det-median').textContent = fmtDuration(d.medianDurationMs);
+  $('#h-det-p90').textContent = fmtDuration(d.p90DurationMs);
+
+  const head = (...cols) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = cols.map((c, i) => `<th${i ? ' class="num"' : ''}>${c}</th>`).join('');
+    return tr;
+  };
+  const empty = [row([['Nada no período', 'muted']])];
+  $('#h-det-books').replaceChildren(
+    head('', 'Qtd.', 'Lucro médio', 'Máx.', 'Duração média'),
+    ...(d.byBooks.length
+      ? d.byBooks.map((g) => row([booksLabel(g.key), [String(g.count), 'num'], [pct(g.avgProfit, 2), 'num money'], [pct(g.maxProfit, 2), 'num'], [fmtDuration(g.avgDurationMs), 'num']]))
+      : empty),
+  );
+  $('#h-det-game').replaceChildren(
+    head('', 'Qtd.', 'Lucro médio', 'Duração média'),
+    ...(d.byGame.length
+      ? d.byGame.map((g) => row([gameMeta(g.key).label, [String(g.count), 'num'], [pct(g.avgProfit, 2), 'num money'], [fmtDuration(g.avgDurationMs), 'num']]))
+      : empty),
+  );
+  const closed = Math.max(1, d.closed);
+  $('#h-det-duration').replaceChildren(
+    head('', 'Qtd.', '% das fechadas'),
+    ...(d.closed
+      ? d.durationBuckets.map((n, i) => row([DURATION_LABELS[i], [String(n), 'num'], [`${Math.round((n / closed) * 100)}%`, 'num']]))
+      : empty),
+  );
+  $('#h-det-reason').replaceChildren(
+    head('', 'Qtd.'),
+    ...(d.byReason.length ? d.byReason.map((g) => row([CLOSED_REASON[g.key] ?? g.key, [String(g.count), 'num']])) : empty),
   );
 }
 
@@ -471,6 +579,12 @@ function createCard(id) {
     for (const leg of entry.opp.legs) window.open(leg.url, '_blank', 'noopener');
   });
   $('.take', el).addEventListener('click', () => takeOpportunity(id));
+  $('.wrong-pair', el).addEventListener('click', () => {
+    const { opp } = state.opps.get(id);
+    const [a, b] = opp.pairEvents;
+    const label = `${opp.eventName} — ${opp.legs.map((l) => BOOK_LABEL[l.book] ?? l.book).join(' × ')}`;
+    blockPair(a, b, label, $('.wrong-pair', el));
+  });
   return el;
 }
 
@@ -499,7 +613,7 @@ async function takeOpportunity(id) {
   const entry = state.opps.get(id);
   if (!entry) return;
   const { opp } = entry;
-  const plan = planArb(opp, state.bankroll);
+  const plan = planCapped(opp, state.bankroll);
   const btn = $('.take', entry.el);
   btn.disabled = true;
   try {
@@ -513,8 +627,8 @@ async function takeOpportunity(id) {
         marketLabel: opp.marketLabel,
         league: opp.league,
         startTime: opp.startTime,
-        profitPct: state.bankroll > 0 ? (plan.profit / state.bankroll) * 100 : opp.profitPct,
-        bankroll: state.bankroll,
+        profitPct: plan.bankroll > 0 ? (plan.profit / plan.bankroll) * 100 : opp.profitPct,
+        bankroll: plan.bankroll,
         stakeA: plan.s1,
         stakeB: plan.s2,
         payout: plan.payout,
@@ -604,16 +718,49 @@ function renderCard(entry, prev) {
     }),
   );
 
+  // Par de eventos de casas diferentes; SIM+NÃO da própria Polymarket não tem par para desfazer.
+  const [ea, eb] = opp.pairEvents ?? [];
+  $('.wrong-pair', el).hidden = entry.closed || opp.id.startsWith('self:') || !ea || !eb || ea === eb;
+
   renderCalc(entry);
+  renderLegAges(entry);
   renderTake(el, opp.id);
   applyFilter(entry);
 }
 
+/** Dado sem atualização da casa há mais que isso: a odd pode já ter mudado lá. */
+const ODDS_STALE_MS = 10_000;
+
+function renderLegAges(entry, now = Date.now()) {
+  entry.opp.legs.forEach((leg, i) => {
+    const box = entry.el.querySelector(`.leg[data-i="${i}"]`);
+    const [seenAt, changedAt] = state.ages[leg.key] ?? [leg.updatedAt, leg.changedAt ?? leg.updatedAt];
+    const seen = now - seenAt;
+    const stale = !entry.closed && seen > ODDS_STALE_MS;
+    // Odd parada com o jogo ao vivo enquanto a outra casa se mexe (marcado pelo motor).
+    const frozen = !entry.closed && leg.frozenMs != null;
+    const age = $('.odds-age', box);
+    age.classList.toggle('stale', stale || frozen);
+    age.title = `Último dado da casa há ${fmtAge(seen)} · odd igual há ${fmtAge(now - changedAt)}`;
+    $('.odds-age-text', age).textContent = frozen
+      ? `Odd parada há ${fmtAge(now - changedAt)}: pode estar congelada`
+      : stale
+        ? `Dado velho: há ${fmtAge(seen)}`
+        : `dado há ${fmtAge(seen)} · odd há ${fmtAge(now - changedAt)}`;
+  });
+}
+
 function renderCalc(entry) {
   const { opp, el } = entry;
-  const bankroll = state.bankroll;
+  const plan = planCapped(opp, state.bankroll);
+  const bankroll = plan.bankroll;
   $('.bank-value', el).textContent = fmtMoney(bankroll);
-  const plan = planArb(opp, bankroll);
+  const capNote = $('.cap-note', el);
+  capNote.hidden = !plan.capped;
+  if (plan.capped) {
+    const who = plan.limited.map((b) => `${BOOK_LABEL[b] ?? b} (${fmtMoney(state.bookCaps[b])})`).join(' e ');
+    $('.cap-text', capNote).textContent = `Limitado pelo máximo da ${who}: banca usada ${fmtMoney(bankroll)} de ${fmtMoney(state.bankroll)}`;
+  }
   [plan.s1, plan.s2].forEach((stake, i) => {
     const box = el.querySelector(`.leg[data-i="${i}"]`);
     const leg = opp.legs[i];
@@ -681,28 +828,56 @@ function removeCard(id, entry) {
 const pct = (v, digits = 1) => `${v >= 0 ? '+' : ''}${v.toFixed(digits).replace('.', ',')}%`;
 const cents = (odds) => `${(100 / odds).toFixed(1).replace('.', ',').replace(/,0$/, '')}¢`;
 
+/** Lista completa (snapshot): remove o que sumiu e atualiza o resto. */
 function renderEv(items, { silent = false } = {}) {
   const ids = new Set(items.map((b) => b.id));
-  for (const [id, entry] of state.ev) {
-    if (ids.has(id)) continue;
-    entry.el.remove();
-    state.ev.delete(id);
-  }
-  for (const bet of items) {
-    let entry = state.ev.get(bet.id);
-    const isNew = !entry;
-    if (!entry) {
-      entry = { bet, el: $('#ev-tpl').content.firstElementChild.cloneNode(true) };
-      state.ev.set(bet.id, entry);
-      $('#ev-feed').append(entry.el);
-    }
-    const prev = entry.bet;
-    entry.bet = bet;
-    renderEvCard(entry, isNew ? null : prev);
-    if (isNew) scheduleHistory();
-    if (isNew && !silent && passesEvFilter(bet) && shouldAlert(bet.id)) alertEv(bet);
-  }
+  for (const id of [...state.ev.keys()]) if (!ids.has(id)) removeEv(id);
+  for (const bet of items) upsertEv(bet, { silent });
   updateEmpty();
+}
+
+function removeEv(id) {
+  const entry = state.ev.get(id);
+  if (!entry) return;
+  entry.el.remove();
+  state.ev.delete(id);
+}
+
+function upsertEv(bet, { silent = false } = {}) {
+  let entry = state.ev.get(bet.id);
+  const isNew = !entry;
+  if (!entry) {
+    entry = { bet, el: $('#ev-tpl').content.firstElementChild.cloneNode(true) };
+    state.ev.set(bet.id, entry);
+    $('#ev-feed').append(entry.el);
+  }
+  const prev = entry.bet;
+  entry.bet = bet;
+  renderEvCard(entry, isNew ? null : prev);
+  if (isNew) scheduleHistory();
+  if (isNew && !silent && passesEvFilter(bet) && shouldAlert(bet.id)) alertEv(bet);
+}
+
+const FROZEN_RE = /há \d+s/;
+
+/** Mesma leitura das pernas da arbitragem: quando chegou o último dado e quando a odd mudou. */
+function renderEvAges(entry, now = Date.now()) {
+  for (const b of entry.bet.books) {
+    const tr = entry.el.querySelector(`tr[data-key="${CSS.escape(b.key)}"]`);
+    if (!tr) continue;
+    const [seenAt, changedAt] = state.ages[b.key] ?? [b.updatedAt, b.updatedAt];
+    const seen = now - seenAt;
+    const stale = seen > ODDS_STALE_MS;
+    const age = $('.row-age', tr);
+    age.classList.toggle('stale', stale);
+    age.textContent = stale ? `Dado velho: há ${fmtAge(seen)}` : `dado há ${fmtAge(seen)} · odd há ${fmtAge(now - changedAt)}`;
+  }
+}
+
+function tickFrozenWarning(entry, now) {
+  if (entry.frozenSince == null) return;
+  const span = entry.el.querySelector('.warnings [data-frozen]');
+  if (span) span.textContent = span.dataset.frozen.replace(FROZEN_RE, `há ${Math.round((now - entry.frozenSince) / 1000)}s`);
 }
 
 function renderEvCard(entry, prev) {
@@ -740,6 +915,7 @@ function renderEvCard(entry, prev) {
   $('tbody', el).replaceChildren(
     ...bet.books.map((b) => {
       const tr = document.createElement('tr');
+      tr.dataset.key = b.key;
       tr.style.setProperty('--book', BOOKS[b.book]?.color);
       if (b === best) tr.className = 'best';
       else if (b === worst) tr.className = 'worst';
@@ -747,7 +923,7 @@ function renderEvCard(entry, prev) {
       const move = b.openingOdds ? (b.odds / b.openingOdds - 1) * 100 : 0;
       const moveCls = Math.abs(move) < 0.05 ? 'flat' : move > 0 ? 'up' : 'down';
       tr.innerHTML = `
-        <td><span class="book-dot"></span><span class="bk"></span><span class="tag"></span></td>
+        <td><span class="book-dot"></span><span class="bk"></span><span class="tag"></span><small class="row-age"></small><small class="row-match"></small></td>
         <td class="num odd"></td>
         <td class="num muted"></td>
         <td class="num muted"></td>
@@ -758,6 +934,9 @@ function renderEvCard(entry, prev) {
       $('.tag', cells[0]).textContent =
         b === best ? 'maior' : !b.inConsensus ? 'margem alta' : b === worst ? 'menor' : '';
       cells[1].textContent = fmtOdds(b.odds);
+      // Pisca a linha de qualquer casa cuja odd mudou desde a última versão, não só a melhor.
+      const was = prev?.books.find((p) => p.key === b.key)?.odds;
+      if (was && was !== b.odds) cells[1].classList.add(b.odds > was ? 'flash-up' : 'flash-down');
       cells[2].textContent = cents(b.odds);
       if (b.maxStake != null) cells[1].title = `Liquidez no melhor preço: ${fmtMoney(b.maxStake)}`;
       cells[3].textContent = `${b.overroundPct.toFixed(1).replace('.', ',')}%`;
@@ -766,6 +945,23 @@ function renderEvCard(entry, prev) {
         ? `${fmtOdds(b.openingOdds)}${moveCls === 'flat' ? '' : ` ${moveCls === 'up' ? '▲' : '▼'} ${pct(move)}`}`
         : '—';
       $('.row-link', tr).href = b.url;
+      // Pareamento direto com a casa da melhor odd: score baixo é sinal de jogo errado.
+      const match = $('.row-match', tr);
+      if (b !== best && b.matchScore != null) {
+        match.textContent = `match ${(b.matchScore * 100).toFixed(0)}% com ${BOOK_LABEL[best.book]}`;
+        match.classList.toggle('low', b.matchScore < 0.9);
+      }
+      if (b !== best && b.eventKey && best.eventKey && b.eventKey !== best.eventKey) {
+        const wrong = document.createElement('button');
+        wrong.type = 'button';
+        wrong.className = 'row-wrong';
+        wrong.title = `Par errado: ${BOOK_LABEL[b.book]} não é o mesmo jogo da ${BOOK_LABEL[best.book]}`;
+        wrong.innerHTML = `<i class="ui" style="--icon: ${uiIcon('circle-x')}"></i>`;
+        wrong.addEventListener('click', () =>
+          blockPair(best.eventKey, b.eventKey, `${bet.eventName} — ${BOOK_LABEL[best.book]} × ${BOOK_LABEL[b.book]}`, wrong),
+        );
+        tr.lastElementChild.append(wrong);
+      }
       return tr;
     }),
   );
@@ -774,13 +970,21 @@ function renderEvCard(entry, prev) {
   $('.disparity', el).textContent = `+${fmtOdds(bet.oddsDiff)} (${pct(bet.disparityPct)})`;
   $('.ev-money', el).textContent = `+${fmtMoney(bet.evPct)}`;
 
+  renderEvAges(entry);
+
+  // O servidor só reenvia a aposta quando ela muda: os segundos de odd parada correm aqui.
+  const frozenMs = bet.books.find((b) => b.frozenMs != null)?.frozenMs;
+  entry.frozenSince = frozenMs == null ? null : Date.now() - frozenMs;
   $('.warnings', el).replaceChildren(
     ...bet.warnings.map((w) => {
       const li = document.createElement('li');
       const icon = document.createElement('i');
       icon.className = 'ui';
       icon.style.setProperty('--icon', uiIcon('triangle-alert'));
-      li.append(icon, w);
+      const text = document.createElement('span');
+      text.textContent = w;
+      if (FROZEN_RE.test(w)) text.dataset.frozen = w;
+      li.append(icon, text);
       return li;
     }),
   );
@@ -796,6 +1000,8 @@ function passesEvFilter(bet) {
   return (
     bet.evPct >= state.minEv &&
     bet.oddsDiff >= state.minDiff - 1e-9 &&
+    (!state.maxBaseOdds || Math.min(...bet.books.map((b) => b.odds)) <= state.maxBaseOdds + 1e-9) &&
+    (!state.maxTopOdds || Math.max(...bet.books.map((b) => b.odds)) <= state.maxTopOdds + 1e-9) &&
     (state.game === 'all' || bet.game === state.game) &&
     (!state.onlyPrematch || !bet.live)
   );
@@ -1053,7 +1259,91 @@ function beep() {
 
 // ------------------------------------------------------------------ controles
 
+// ------------------------------------------------------------------ par errado e limites
+
+async function postJson(url, body) {
+  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+async function blockPair(a, b, label, btn) {
+  if (!confirm(`Marcar como par errado?\n\n${label}\n\nO bot deixa de parear esses dois eventos (dá para desfazer no Histórico).`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    await postJson('/api/block', { a, b, label });
+  } catch (err) {
+    alert(`Não deu para bloquear: ${err.message ?? err}`);
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderBlocked(items) {
+  state.blocked = items;
+  $('#blocked-box').hidden = !items.length;
+  $('#blocked-table').replaceChildren(
+    ...[...items]
+      .sort((x, y) => y.blockedAt - x.blockedAt)
+      .map((p) => {
+        const tr = document.createElement('tr');
+        const label = document.createElement('td');
+        label.textContent = p.label;
+        const when = document.createElement('td');
+        when.className = 'num muted';
+        when.textContent = fmtWhen(p.blockedAt);
+        const act = document.createElement('td');
+        act.className = 'num';
+        const undo = document.createElement('button');
+        undo.type = 'button';
+        undo.textContent = 'Desfazer';
+        undo.addEventListener('click', async () => {
+          undo.disabled = true;
+          try {
+            await postJson('/api/unblock', { a: p.a, b: p.b });
+          } catch (err) {
+            alert(`Não deu para desfazer: ${err.message ?? err}`);
+            undo.disabled = false;
+          }
+        });
+        act.append(undo);
+        tr.append(label, when, act);
+        return tr;
+      }),
+  );
+}
+
+function renderCaps() {
+  const books = Object.keys(BOOKS).filter((b) => b !== 'simulator');
+  const count = () => ($('#caps-count').textContent = Object.keys(state.bookCaps).length || '');
+  $('#caps-grid').replaceChildren(
+    ...books.flatMap((book) => {
+      const label = document.createElement('label');
+      label.textContent = BOOK_LABEL[book];
+      label.htmlFor = `cap-${book}`;
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.id = `cap-${book}`;
+      input.min = '0';
+      input.step = '10';
+      input.placeholder = 'sem limite';
+      input.value = state.bookCaps[book] ?? '';
+      input.addEventListener('input', () => {
+        const v = Number(input.value);
+        if (v > 0) state.bookCaps[book] = v;
+        else delete state.bookCaps[book];
+        localStorage.setItem('bookCaps', JSON.stringify(state.bookCaps));
+        count();
+        refreshAll();
+      });
+      return [label, input];
+    }),
+  );
+  count();
+}
+
 function initControls() {
+  renderCaps();
   const bankroll = $('#bankroll');
   bankroll.value = state.bankroll;
   bankroll.addEventListener('input', () => {
@@ -1096,6 +1386,22 @@ function initControls() {
   minDiff.addEventListener('input', () => {
     state.minDiff = Number(minDiff.value) || 0;
     localStorage.setItem('minDiff', String(state.minDiff));
+    chipsSig = '';
+    refreshAll();
+  });
+  const maxBaseOdds = $('#max-base-odds');
+  maxBaseOdds.value = state.maxBaseOdds;
+  maxBaseOdds.addEventListener('input', () => {
+    state.maxBaseOdds = Number(maxBaseOdds.value) || 0;
+    localStorage.setItem('maxBaseOdds', String(state.maxBaseOdds));
+    chipsSig = '';
+    refreshAll();
+  });
+  const maxTopOdds = $('#max-top-odds');
+  maxTopOdds.value = state.maxTopOdds;
+  maxTopOdds.addEventListener('input', () => {
+    state.maxTopOdds = Number(maxTopOdds.value) || 0;
+    localStorage.setItem('maxTopOdds', String(state.maxTopOdds));
     chipsSig = '';
     refreshAll();
   });
@@ -1170,9 +1476,12 @@ function initControls() {
     for (const entry of state.opps.values()) {
       const secs = Math.round((now - entry.opp.firstSeen) / 1000);
       $('.age-text', entry.el).textContent = `aberta há ${secs}s`;
+      renderLegAges(entry, now);
     }
     for (const entry of state.ev.values()) {
       $('.age-text', entry.el).textContent = `há ${fmtAge(now - entry.bet.firstSeen)}`;
+      tickFrozenWarning(entry, now);
+      renderEvAges(entry, now);
     }
   }, 1000);
 }

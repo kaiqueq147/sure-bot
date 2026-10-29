@@ -1,4 +1,4 @@
-export type BookId = 'polymarket' | 'thunderpick' | 'duel';
+export type BookId = 'polymarket' | 'thunderpick' | 'duel' | 'cloudbet' | 'stake';
 
 export type Game =
   | 'cs2'
@@ -15,16 +15,26 @@ export type Game =
   | 'aov'
   | 'other';
 
-export type MarketType = 'winner' | 'handicap' | 'total' | 'map';
+export type MarketType =
+  | 'winner'
+  | 'handicap'
+  | 'total'
+  | 'map'
+  | 'map_rounds_hcp'
+  | 'map_rounds_total'
+  | 'map_kills_hcp'
+  | 'map_kills_total';
 
 /**
  * Mercado de 2 vias da série. Handicap: `line` é a linha do teamA (ex: −1.5) e o teamB tem −line.
  * Total de mapas: lado A = mais de `line`, lado B = menos de `line`. Só linhas x.5 (sem devolução).
  * Vencedor do mapa: `line` é o número do mapa; lados A/B = teamA/teamB, como no vencedor.
+ * Mercados de um mapa (`map_*`): `map` é o número do mapa e `line` segue a regra de handicap/total.
  */
 export interface MarketSpec {
   type: MarketType;
   line?: number;
+  map?: number;
 }
 
 /** Nível do livro de ofertas: [preço por share 0..1, quantidade de shares] */
@@ -63,6 +73,8 @@ export interface Quote {
   url: string;
   /** epoch ms da última atualização de preço */
   updatedAt: number;
+  /** epoch ms em que odds/suspensão mudaram pela última vez (definido pelo OddsStore) */
+  changedAt?: number;
 }
 
 export interface Leg {
@@ -81,6 +93,10 @@ export interface Leg {
   commissionPct?: number;
   url: string;
   updatedAt: number;
+  /** Quando o preço desta perna mudou pela última vez (preenchido ao enviar ao dashboard) */
+  changedAt?: number;
+  /** Jogo ao vivo com o preço parado há este tempo enquanto a outra casa se mexeu (provável odd congelada) */
+  frozenMs?: number;
 }
 
 export type OpportunityStatus = 'pending' | 'confirmed';
@@ -102,6 +118,8 @@ export interface Opportunity {
   updatedAt: number;
   matchScore: number;
   warnings: string[];
+  /** `eventKey` dos eventos das duas pernas (preenchido ao enviar ao dashboard, para "par errado") */
+  pairEvents?: [string, string];
 }
 
 export type ClosedReason = 'odds_moved' | 'stale' | 'unmatched';
@@ -124,6 +142,12 @@ export interface ValueBookOdds {
   maxStake?: number;
   url: string;
   updatedAt: number;
+  /** Jogo ao vivo com o preço parado há este tempo enquanto outras casas se mexeram */
+  frozenMs?: number;
+  /** Evento desta casa (preenchido ao enviar ao dashboard, para "par errado") */
+  eventKey?: string;
+  /** Score do pareamento direto com a casa da melhor odd (preenchido ao enviar ao dashboard) */
+  matchScore?: number;
 }
 
 /** Seleção cuja melhor odd está acima do consenso das outras casas (EV+). */
@@ -164,6 +188,10 @@ export interface SourceStatus {
   detail?: string;
   /** Atraso médio do dado, quando a fonte consegue medir */
   latencyMs?: number;
+  /** Respostas 403/503/challenge da Cloudflare no último minuto */
+  blockedPerMin?: number;
+  /** Respostas 429 no último minuto */
+  rateLimitedPerMin?: number;
 }
 
 export interface Source {

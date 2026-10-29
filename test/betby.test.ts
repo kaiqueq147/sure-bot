@@ -91,3 +91,40 @@ test('fonte aplica snapshot e delta, gera link e trata evento nulo', async () =>
     globalThis.fetch = realFetch;
   }
 });
+
+test('ciclo sem mudança renova updatedAt sem alterar changedAt', async () => {
+  const store = new OddsStore();
+  const base = 'https://api.test/api/v4';
+  const manifest = (version: number) => ({ version, top_events_versions: [version], rest_events_versions: [] });
+  const responses = new Map<string, unknown>([
+    [`${base}/live/brand/b/en/0`, manifest(100)],
+    [`${base}/prematch/brand/b/en/0`, manifest(200)],
+    [`${base}/live/brand/b/en/100`, { version: 100, events: {} }],
+    [`${base}/prematch/brand/b/en/200`, { version: 200, events: { e1: event('2.88', '1.33') } }],
+  ]);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL) => {
+    const url = String(input);
+    // Delta sempre vazio: as odds nunca mudam.
+    return new Response(JSON.stringify(responses.get(url) ?? { events: {} }));
+  }) as typeof fetch;
+
+  try {
+    const src = new BetbySource(store, {
+      book: 'duel', apiBase: base, brandId: 'b', siteUrl: 'https://duel.com', lang: 'en',
+      liveIntervalMs: 20, prematchIntervalMs: 20,
+    });
+    src.start();
+    await new Promise((r) => setTimeout(r, 15));
+    const first = store.get('duel:e1');
+    assert.ok(first);
+    const { updatedAt, changedAt } = first;
+    await new Promise((r) => setTimeout(r, 80));
+    src.stop();
+    const later = store.get('duel:e1')!;
+    assert.ok(later.updatedAt > updatedAt, 'feed confirmou as odds: dado renovado');
+    assert.equal(later.changedAt, changedAt, 'preço igual: changedAt não muda');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

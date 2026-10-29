@@ -3,13 +3,17 @@ import type { OddsStore } from '../core/OddsStore.js';
 import { marketLabel } from '../core/markets.js';
 import type { MatchPair } from '../matching/matcher.js';
 import type { BookId, Quote, ValueBet, ValueBookOdds } from '../types.js';
-import { effectiveOdds, fairProbA } from './math.js';
+import { effectiveOdds, fairProbA, frozenFor } from './math.js';
 
 export interface ValueOptions {
   minEvPct: number;
   warnEvPct: number;
   maxOverroundPct: number;
   commissionPct: Partial<Record<BookId, number>>;
+  /** Mínimo de outras casas no consenso para calcular a odd justa (padrão 2) */
+  minConsensusBooks?: number;
+  /** Ao vivo: preço parado por este tempo enquanto outras casas se mexem = odd congelada (0 desliga) */
+  frozenMs?: number;
 }
 
 /** Jogo pareado entre casas; `flip` = teamA da casa corresponde ao lado B do grupo. */
@@ -95,14 +99,17 @@ export class ValueScanner extends EventEmitter {
     return [...this.bets.values()].sort((a, b) => b.evPct - a.evPct);
   }
 
-  /** Ticks chegam em rajadas; no máximo uma varredura a cada 250ms. */
+  /**
+   * Ticks chegam em rajadas; no máximo uma varredura a cada 100ms (imperceptível no painel e
+   * evita reenviar a lista inteira de EV dezenas de vezes por segundo com a Polymarket agitada).
+   */
   private schedule(): void {
     if (this.scheduled) return;
     this.scheduled = true;
     setTimeout(() => {
       this.scheduled = false;
       this.scan();
-    }, 250);
+    }, 100);
   }
 
   private trackOpening(q: Quote): { a: number; b: number } {
@@ -127,7 +134,7 @@ export class ValueScanner extends EventEmitter {
       if (members.length < 2) continue;
 
       for (const side of ['A', 'B'] as const) {
-        const rows = members.map(({ q, flip }) => {
+        const rows = members.map(({ q, flip }): { q: Quote; own: 'A' | 'B'; row: ValueBookOdds } => {
           const own: 'A' | 'B' = (side === 'A') !== flip ? 'A' : 'B';
           const odds = (own === 'A' ? q.oddsA : q.oddsB)!;
           const other = (own === 'A' ? q.oddsB : q.oddsA)!;
@@ -154,8 +161,9 @@ export class ValueScanner extends EventEmitter {
         });
         rows.sort((a, b) => b.row.effectiveOdds - a.row.effectiveOdds);
         const best = rows[0];
+        // A odd justa vem só das outras casas dentro do consenso; com poucas, um erro de uma casa vira "EV".
         const others = rows.slice(1).filter((r) => r.row.inConsensus);
-        if (!others.length) continue;
+        if (!others.length || others.length < (this.opts.minConsensusBooks ?? 2)) continue;
         const fairProb = others.reduce((s, r) => s + r.row.fairProb, 0) / others.length;
         const evPct = (best.row.effectiveOdds * fairProb - 1) * 100;
         if (evPct < this.opts.minEvPct) continue;
@@ -168,6 +176,11 @@ export class ValueScanner extends EventEmitter {
         const live = !!ref.startTime && ref.startTime <= now;
         if (live) warnings.push('Jogo ao vivo: as odds mudam em segundos.');
         if (others.length === 1) warnings.push('Consenso baseado em uma única casa.');
+        const frozen = frozenFor(ref, rows.slice(1).map((r) => r.q), now, this.opts.frozenMs ?? 30_000);
+        if (frozen !== undefined) {
+          best.row.frozenMs = frozen;
+          warnings.push(`Odd da ${best.row.book} parada há ${Math.round(frozen / 1000)}s com o jogo ao vivo: pode estar congelada.`);
+        }
         if (best.row.maxStake != null && best.row.maxStake < 50)
           warnings.push(`Pouca liquidez na melhor odd ($${best.row.maxStake.toFixed(2)}).`);
 

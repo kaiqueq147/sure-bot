@@ -57,3 +57,81 @@ test('banco só grava a arbitragem que você marcar, e não duplica', async () =
     }
   }
 });
+
+test('estatísticas das detectadas: duração, pares de casas e reaparição', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'surebot-'));
+  try {
+    const db = (await Persistence.open({ path: path.join(dir, 'test.db'), retentionDays: 90 }))!;
+    const t0 = Date.now() - 60_000;
+    const base = { id: 'x', game: 'cs2' as const, books: 'duel×stake', market: 'Vencedor', profitPct: 1 };
+    db.recordDetected({ ...base, firstSeen: t0 }, t0);
+    db.recordDetected({ ...base, firstSeen: t0, profitPct: 3 }, t0 + 1_000);
+    db.closeDetected('x', 'odds_moved', t0 + 2_000);
+    // a mesma surebet reaparece: nova linha, ainda aberta
+    db.recordDetected({ ...base, firstSeen: t0 + 40_000, profitPct: 2 }, t0 + 40_000);
+    db.recordDetected({ id: 'y', game: 'lol', books: 'cloudbet×polymarket', market: 'Vencedor', profitPct: 4, firstSeen: t0 }, t0);
+    db.closeDetected('y', 'stale', t0 + 50_000);
+
+    const d = db.report(t0 - 1_000).detected;
+    assert.equal(d.count, 3);
+    assert.equal(d.closed, 2);
+    assert.equal(d.avgProfitPct, 3);
+    assert.deepEqual(d.durationBuckets, [1, 0, 1, 0, 0]);
+    assert.equal(d.byBooks[0].key, 'duel×stake');
+    assert.equal(d.byBooks[0].count, 2);
+    assert.equal(d.byBooks[0].maxProfit, 3);
+    assert.equal(d.byBooks[0].avgDurationMs, 2_000);
+    assert.deepEqual(d.byReason.map((r) => r.key).sort(), ['odds_moved', 'stale']);
+    db.close();
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows pode manter o WAL aberto por um instante depois do close
+    }
+  }
+});
+
+test('detectada reaberta com o mesmo firstSeen volta a ficar aberta', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'surebot-'));
+  try {
+    const db = (await Persistence.open({ path: path.join(dir, 'test.db'), retentionDays: 90 }))!;
+    const t0 = Date.now() - 60_000;
+    const d = { id: 'x', firstSeen: t0, game: 'cs2' as const, books: 'duel×stake', market: 'Vencedor', profitPct: 1 };
+    db.recordDetected(d, t0);
+    db.closeDetected('x', 'odds_moved', t0 + 1_000);
+    db.recordDetected(d, t0 + 2_000);
+    assert.equal(db.report(t0 - 1).detected.closed, 0);
+    db.closeDetected('x', 'stale', t0 + 9_000);
+    assert.equal(db.report(t0 - 1).detected.medianDurationMs, 9_000);
+    db.close();
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows pode manter o WAL aberto por um instante depois do close
+    }
+  }
+});
+
+test('pares bloqueados persistem e podem ser desfeitos', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'surebot-'));
+  try {
+    const file = path.join(dir, 'test.db');
+    const db = (await Persistence.open({ path: file, retentionDays: 90 }))!;
+    db.blockPair({ a: 'duel:9', b: 'stake:1', label: 'NAVI × FaZe', blockedAt: 1 });
+    db.blockPair({ a: 'duel:9', b: 'stake:1', label: 'NAVI × FaZe', blockedAt: 2 });
+    db.close();
+    const db2 = (await Persistence.open({ path: file, retentionDays: 90 }))!;
+    assert.deepEqual(db2.blockedPairs(), [{ a: 'duel:9', b: 'stake:1', label: 'NAVI × FaZe', blockedAt: 2 }]);
+    db2.unblockPair('duel:9', 'stake:1');
+    assert.equal(db2.blockedPairs().length, 0);
+    db2.close();
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows pode manter o WAL aberto por um instante depois do close
+    }
+  }
+});

@@ -103,3 +103,27 @@ test('odds de casa indisponível ou vencidas não geram oportunidade', async () 
   assert.equal(found.length, 1);
   engine.stop();
 });
+
+test('motor sinaliza perna congelada ao vivo sem esconder a oportunidade', async () => {
+  const store = new OddsStore();
+  const engine = new ArbitrageEngine(store, {
+    minProfitPct: 0, maxProfitPct: 50, confirmMs: 0, matchThreshold: 0.78, maxStartDiffMs: 6 * 3600_000,
+    commissionPct: {}, frozenMs: 30_000,
+  });
+  const found: Opportunity[] = [];
+  engine.on('opportunity', (o) => found.push(o));
+  const now = Date.now();
+  const startTime = now - 600_000;
+  store.upsert(quote({ key: 'polymarket:1', book: 'polymarket', teamA: 'NAVI', teamB: 'FaZe', oddsA: 2.3, oddsB: 1.6, startTime }));
+  store.upsert(quote({ key: 'thunderpick:1', book: 'thunderpick', teamA: 'NAVI', teamB: 'FaZe', oddsA: 1.6, oddsB: 2.3, startTime }));
+  store.get('polymarket:1')!.changedAt = now - 90_000;
+  store.get('thunderpick:1')!.changedAt = now - 1_000;
+  await flush();
+
+  const opp = found.at(-1);
+  assert.ok(opp, 'oportunidade continua aparecendo');
+  assert.ok(opp.legs[0].frozenMs! >= 90_000, 'perna da Polymarket marcada');
+  assert.equal(opp.legs[1].frozenMs, undefined);
+  assert.ok(opp.warnings.some((w) => w.includes('polymarket') && w.includes('congelada')));
+  engine.stop();
+});

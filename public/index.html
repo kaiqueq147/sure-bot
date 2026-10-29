@@ -12,7 +12,7 @@
         <span class="logo"><i class="ui" style="--icon: url(/icons/ui/banknote.svg)"></i></span>
         <div>
           <h1>Sure-Bot</h1>
-          <small>Polymarket × Thunderpick × Duel · eSports</small>
+          <small>Polymarket × Thunderpick × Duel × Cloudbet × Stake · eSports</small>
         </div>
       </div>
       <div class="status" id="status">
@@ -25,12 +25,12 @@
         <thead>
           <tr>
             <th>Casa</th><th>Estado</th><th class="num">Mercados</th><th class="num">Atualizações/min</th>
-            <th class="num">Último dado</th><th class="num">Latência</th><th class="num">Uptime</th><th class="num">Quedas</th><th>Detalhe</th>
+            <th class="num">Último dado</th><th class="num">Latência</th><th class="num">Uptime</th><th class="num">Quedas</th><th class="num" title="Respostas 403 (bloqueio/challenge) e 429 (rate limit) no último minuto">Bloqueios/min</th><th>Detalhe</th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
-      <small>Latência: Polymarket = atraso das mensagens em relação ao carimbo do servidor; Duel = ida e volta do delta; Thunderpick = fetch do snapshot dentro da página. Uptime e quedas contam desde a primeira conexão.</small>
+      <small>Latência: Polymarket = atraso das mensagens em relação ao carimbo do servidor; Duel = ida e volta do delta; Cloudbet e Stake = ida e volta do feed; Thunderpick = fetch do snapshot dentro da página. Uptime e quedas contam desde a primeira conexão. Bloqueios/min = respostas 403 · 429 no último minuto; se ficar acima de 0, aumente o intervalo de consulta da casa (ex.: <code>STAKE_INTERVAL_MS</code>).</small>
     </section>
 
     <section class="controls">
@@ -38,6 +38,13 @@
         <span><i class="ui" style="--icon: url(/icons/ui/wallet.svg)"></i>Banca padrão</span>
         <span class="adorn">$<input type="number" id="bankroll" min="1" step="10" value="1000" /></span>
       </label>
+      <details class="caps arb-only" id="caps">
+        <summary><i class="ui" style="--icon: url(/icons/ui/banknote.svg)"></i>Limite por casa<span class="caps-count" id="caps-count"></span></summary>
+        <div class="caps-body">
+          <small>Aposta máxima que cada casa aceita para você. Vazio = sem limite. A banca da arbitragem é reduzida para a perna caber.</small>
+          <div class="caps-grid" id="caps-grid"></div>
+        </div>
+      </details>
       <label class="arb-only">
         <span><i class="ui" style="--icon: url(/icons/ui/percent.svg)"></i>Lucro mínimo</span>
         <input type="number" id="min-profit" min="0" step="0.1" value="0" />
@@ -49,6 +56,14 @@
       <label class="ev-only">
         <span><i class="ui" style="--icon: url(/icons/ui/arrow-left-right.svg)"></i>Diferença mínima (odd)</span>
         <input type="number" id="min-diff" min="0" step="0.05" value="0.3" />
+      </label>
+      <label class="ev-only" title="A menor odd entre as casas precisa ser até este valor (0 = sem limite). Odds altas têm pouca chance de bater.">
+        <span><i class="ui" style="--icon: url(/icons/ui/scale.svg)"></i>Menor odd até</span>
+        <input type="number" id="max-base-odds" min="0" step="0.1" value="4" />
+      </label>
+      <label class="ev-only" title="A maior odd entre as casas precisa ser até este valor (0 = sem limite).">
+        <span><i class="ui" style="--icon: url(/icons/ui/scale.svg)"></i>Maior odd até</span>
+        <input type="number" id="max-top-odds" min="0" step="0.1" value="0" />
       </label>
       <label class="check arb-only"><input type="checkbox" id="only-confirmed" /><i class="ui" style="--icon: url(/icons/ui/circle-check.svg)"></i>Só confirmadas</label>
       <label class="check ev-only"><input type="checkbox" id="only-prematch" /><i class="ui" style="--icon: url(/icons/ui/calendar-clock.svg)"></i>Só pré-jogo</label>
@@ -100,6 +115,10 @@
         <div id="ev-feed" class="feed"></div>
       </section>
       <section id="tab-hist" hidden>
+        <div class="hist-box blocked-box" id="blocked-box" hidden>
+          <h3>Pares bloqueados <small class="muted">(marcados como "par errado"; o bot não pareia esses eventos)</small></h3>
+          <div class="table-scroll"><table class="hist-table wide" id="blocked-table"></table></div>
+        </div>
         <div id="hist-empty" class="empty" hidden>
           <p>Histórico indisponível.</p>
           <small id="hist-error"></small>
@@ -116,6 +135,19 @@
             <div class="hist-box"><h3>Por par de casas</h3><table class="hist-table" id="h-by-books"></table></div>
             <div class="hist-box"><h3>Por mercado</h3><table class="hist-table" id="h-by-market"></table></div>
             <div class="hist-box"><h3>Por hora do dia</h3><div class="hour-bars" id="h-by-hour"></div></div>
+          </div>
+          <h3 class="hist-section">Todas as surebets detectadas <small class="muted">(confirmadas pelo motor, marcadas ou não)</small></h3>
+          <div class="hist-kpis">
+            <div class="kpi-card"><small>Detectadas</small><strong id="h-det-count">—</strong><span id="h-det-closed" class="muted"></span></div>
+            <div class="kpi-card"><small>Lucro médio (pico)</small><strong id="h-det-avg" class="money">—</strong></div>
+            <div class="kpi-card"><small>Duração mediana</small><strong id="h-det-median">—</strong><span class="muted">quanto tempo ficam abertas</span></div>
+            <div class="kpi-card"><small>Duração p90</small><strong id="h-det-p90">—</strong><span class="muted">9 em 10 fecham antes disso</span></div>
+          </div>
+          <div class="hist-grid">
+            <div class="hist-box"><h3>Por par de casas</h3><table class="hist-table" id="h-det-books"></table></div>
+            <div class="hist-box"><h3>Quanto tempo duraram</h3><table class="hist-table" id="h-det-duration"></table></div>
+            <div class="hist-box"><h3>Por modalidade</h3><table class="hist-table" id="h-det-game"></table></div>
+            <div class="hist-box"><h3>Por que fecharam</h3><table class="hist-table" id="h-det-reason"></table></div>
           </div>
           <div class="hist-box">
             <h3>Feitas</h3>
@@ -138,6 +170,7 @@
         <div class="legs">
           <div class="leg" data-i="0">
             <div class="leg-head"><span class="book"></span><span class="pick-label">Aposta em</span></div>
+            <div class="odds-age"><i class="ui" style="--icon: url(/icons/ui/clock.svg)"></i><span class="odds-age-text"></span></div>
             <div class="selection"></div>
             <div class="odds-box"><span class="odds-label">Odd</span><span class="odds"></span><i class="ui trend"></i><span class="prob"></span></div>
             <div class="eff"></div>
@@ -151,6 +184,7 @@
           </div>
           <div class="leg" data-i="1">
             <div class="leg-head"><span class="book"></span><span class="pick-label">Aposta em</span></div>
+            <div class="odds-age"><i class="ui" style="--icon: url(/icons/ui/clock.svg)"></i><span class="odds-age-text"></span></div>
             <div class="selection"></div>
             <div class="odds-box"><span class="odds-label">Odd</span><span class="odds"></span><i class="ui trend"></i><span class="prob"></span></div>
             <div class="eff"></div>
@@ -170,6 +204,7 @@
             <div class="kpi gain"><small><i class="ui" style="--icon: url(/icons/ui/hand-coins.svg)"></i>Lucro</small><strong class="gain-value"></strong></div>
           </div>
           <p class="exec-note"><i class="ui" style="--icon: url(/icons/ui/droplets.svg)"></i><span class="exec-text"></span></p>
+          <p class="cap-note" hidden><i class="ui" style="--icon: url(/icons/ui/banknote.svg)"></i><span class="cap-text"></span></p>
         </div>
         <div class="chart">
           <div class="chart-head"><span><i class="ui" style="--icon: url(/icons/ui/chart-line.svg)"></i>Margem (soma das probabilidades)</span><span class="chart-legend"></span></div>
@@ -180,6 +215,7 @@
           <span class="age"><i class="ui" style="--icon: url(/icons/ui/clock.svg)"></i><span class="age-text"></span></span>
           <div class="card-actions">
             <button type="button" class="take"><i class="ui" style="--icon: url(/icons/ui/circle-check.svg)"></i><span class="take-text">Fiz esta</span></button>
+            <button type="button" class="wrong-pair" title="Os dois eventos não são o mesmo jogo: o bot deixa de pareá-los"><i class="ui" style="--icon: url(/icons/ui/circle-x.svg)"></i><span>Par errado</span></button>
             <button type="button" class="open-both"><i class="ui" style="--icon: url(/icons/ui/layers.svg)"></i>Abrir as duas casas</button>
           </div>
         </footer>

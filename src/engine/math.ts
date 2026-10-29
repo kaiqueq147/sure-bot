@@ -1,3 +1,21 @@
+/**
+ * Odd provavelmente congelada: jogo ao vivo, preço parado há `thresholdMs` ou mais e alguma outra
+ * casa do mesmo mercado mudou de preço depois disso. Pré-jogo fica parado legitimamente.
+ * Retorna há quanto tempo o preço está parado, ou undefined se não parece congelada.
+ */
+export function frozenFor(
+  q: { startTime?: number; updatedAt: number; changedAt?: number },
+  peers: ReadonlyArray<{ updatedAt: number; changedAt?: number }>,
+  now: number,
+  thresholdMs: number,
+): number | undefined {
+  if (!thresholdMs || !q.startTime || q.startTime > now) return undefined;
+  const changed = q.changedAt ?? q.updatedAt;
+  const age = now - changed;
+  if (age < thresholdMs) return undefined;
+  return peers.some((p) => (p.changedAt ?? p.updatedAt) > changed) ? age : undefined;
+}
+
 /** Soma das probabilidades implícitas. < 1 indica arbitragem. */
 export function arbMargin(odds1: number, odds2: number): number {
   return 1 / odds1 + 1 / odds2;

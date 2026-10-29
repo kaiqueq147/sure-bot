@@ -1,4 +1,4 @@
-# Sure-Bot — Arbitragem de eSports (Polymarket × Thunderpick × Duel)
+# Sure-Bot — Arbitragem de eSports (Polymarket × Thunderpick × Duel × Cloudbet × Stake)
 
 Monitora em tempo real o mercado de **vencedor da partida** nas três casas, cruza os mesmos jogos
 mesmo com nomes diferentes e mostra no dashboard cada oportunidade de lucro garantido, com
@@ -41,6 +41,8 @@ stake sugerida e links diretos. Há um motor de arbitragem por par de casas.
 | Polymarket (Gamma + CLOB WS) | `src/sources/polymarket.ts` |
 | Thunderpick (Playwright + parser) | `src/sources/thunderpick.ts`, `src/sources/thunderpickExtract.ts` |
 | Duel e outras casas com Betby | `src/sources/betby.ts` |
+| Cloudbet | `src/sources/cloudbet.ts` |
+| Stake | `src/sources/stake.ts` |
 | Normalização e matching de times | `src/matching/normalize.ts`, `src/matching/matcher.ts` |
 | Fórmulas e motor | `src/engine/math.ts`, `src/engine/ArbitrageEngine.ts` |
 | Dashboard | `public/` |
@@ -85,6 +87,19 @@ público e versionado, que funciona direto do Node, sem navegador e sem Cloudfla
 - `GET .../{versão + Date.now()}` → delta com os eventos alterados, buscado a cada 2s, como faz o próprio site. Um `null` indica mercados recolhidos por instantes (eles voltam em deltas só com `markets`). Jogos encerrados saem no snapshot seguinte.
 
 Os links das partidas usam `https://duel.com/sports?bt-path=/{esporte}/{categoria}/{torneio}/{evento}-{id}`; o caminho direto sem `bt-path` dá 404.
+
+**Cloudbet.** O site consome um feed JSON público (`/sports-api/c/v6/sports/events`), sem chave nem
+desafio anti-bot, e não tem WebSocket de odds para visitantes. O bot roda dois ciclos: só os jogos ao
+vivo a cada 1s (payload pequeno) e todos os jogos a cada 3s. Mercados `<esporte>.winner`,
+`.map_handicap` (`handicap=<linha da casa>`), `.total_maps` (`total=<linha>`) e `.map_winner`
+(`map=<n>`). Odds sem confirmação do feed por `CLOUDBET_STALE_MS` são descartadas.
+
+**Stake.** API GraphQL (`POST /_api/graphql`, introspecção desligada). Uma única query com um alias
+por esporte (`slugSport` → `fixtureList(type: live|upcoming, limit ≤ 50)`) traz todos os jogos em ~200 KB,
+a no máximo 1 req/s. Templates Oddin: `1` vencedor (`way=two`), `2` handicap de mapas (`handicap=<linha da casa>`),
+`3` total de mapas (`threshold=<linha>`) e `6` vencedor do mapa (primeiro template do grupo `maps`, pedido
+com `templates(limit: 1)` para não baixar os mercados de rounds). A Cloudflare pode responder 403 a
+clientes que não são navegador; nesse caso informe `STAKE_CF_CLEARANCE` (ou `STAKE_COOKIE_FILE`, relido a cada 403).
 
 Os mercados seguem os IDs do Sportradar: **186 = Winner** (outcome `4` = casa, `5` = fora; `b: 1` = bloqueado).
 A Betby também abre um WebSocket (`/api/v1/ws_new`), mas ele não envia odds para visitantes não
@@ -140,6 +155,8 @@ também em `/api/health`). O botão fica âmbar ou vermelho quando alguma casa d
 
 - **Polymarket:** chegada das mensagens `price_change` menos o `timestamp` do servidor (inclui diferença de relógio);
 - **Duel:** ida e volta da requisição de delta;
+- **Cloudbet:** ida e volta da requisição do feed;
+- **Stake:** ida e volta da requisição GraphQL;
 - **Thunderpick:** ida e volta do fetch do snapshot dentro da página.
 
 ## Persistência e relatório

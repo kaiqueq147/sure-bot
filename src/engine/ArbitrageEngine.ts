@@ -1,10 +1,10 @@
 import { EventEmitter } from 'node:events';
 import type { OddsStore } from '../core/OddsStore.js';
 import { createLogger } from '../core/logger.js';
-import { marketLabel, sameMarket } from '../core/markets.js';
+import { isHandicapType, isTotalType, marketLabel, sameMarket } from '../core/markets.js';
 import { matchQuotes, type MatchPair } from '../matching/matcher.js';
 import type { BookId, ClosedReason, Leg, Opportunity, Quote } from '../types.js';
-import { arbMargin, effectiveOdds, profitPct } from './math.js';
+import { arbMargin, effectiveOdds, frozenFor, profitPct } from './math.js';
 
 export interface EngineOptions {
   minProfitPct: number;
@@ -13,7 +13,11 @@ export interface EngineOptions {
   matchThreshold: number;
   maxStartDiffMs: number;
   commissionPct: Partial<Record<BookId, number>>;
+  /** Ao vivo: preço parado por este tempo enquanto a outra casa se mexe = odd congelada (0 desliga) */
+  frozenMs?: number;
 }
+
+const DEFAULT_FROZEN_MS = 30_000;
 
 const log = createLogger('engine');
 const REOPEN_GRACE_MS = 15_000;
@@ -39,8 +43,8 @@ export function derivedPairs(winners: readonly MatchPair[], left: Quote[], right
     const rs = rightBy.get(p.rightKey) ?? [];
     for (const dl of leftBy.get(p.leftKey) ?? []) {
       // Total não depende da ordem dos times; handicap troca o lado e nega a linha; mapa só troca o lado.
-      const swapped = dl.market.type !== 'total' && p.swapped;
-      const negate = dl.market.type === 'handicap' && swapped;
+      const swapped = !isTotalType(dl.market.type) && p.swapped;
+      const negate = isHandicapType(dl.market.type) && swapped;
       const want = { ...dl.market, line: negate ? -dl.market.line! : dl.market.line };
       const dr = rs.find((q) => sameMarket(q.market, want));
       if (dr) out.push({ id: `${dl.key}|${dr.key}`, leftKey: dl.key, rightKey: dr.key, swapped, score: p.score });
@@ -128,7 +132,7 @@ export class ArbitrageEngine extends EventEmitter {
     );
     this.pairs = [...winners, ...derivedPairs(winners, left, right)];
     if (this.pairs.length !== before) {
-      log.info(`${winners.length} eventos pareados entre ${this.left} e ${this.right} (${this.pairs.length - winners.length} mercados de handicap/total)`);
+      log.info(`${winners.length} eventos pareados entre ${this.left} e ${this.right} (${this.pairs.length - winners.length} mercados de handicap/total/mapa)`);
     }
     this.emit('pairs', this.pairs.length);
     this.evaluate();
@@ -218,12 +222,27 @@ export class ArbitrageEngine extends EventEmitter {
     const warnings: string[] = [];
     if (pct > this.opts.maxProfitPct) warnings.push('Lucro anormalmente alto: confira se é o mesmo jogo/mercado e se a odd não está congelada.');
     if (pair.score < 0.9) warnings.push(`Correspondência de times incerta (score ${pair.score.toFixed(2)}).`);
-    if (l.market.type === 'map' && l.market.line! >= 3) {
-      warnings.push(`O mapa ${l.market.line} pode não ser jogado se a série acabar antes; cada casa tem sua regra de anulação, confira antes de apostar.`);
+    // Vencedor do mapa guarda o número em `line`; os demais mercados de um mapa, em `map`.
+    const mapNo = l.market.type === 'map' ? l.market.line : l.market.map;
+    if (mapNo !== undefined && mapNo >= 3) {
+      warnings.push(`O mapa ${mapNo} pode não ser jogado se a série acabar antes; cada casa tem sua regra de anulação, confira antes de apostar.`);
     }
-    if (l.market.type === 'map' && l.startTime && l.startTime <= now) {
+    if (mapNo !== undefined && l.startTime && l.startTime <= now) {
       warnings.push('Jogo em andamento: o mapa pode já ter começado ou terminado em uma das casas.');
     }
+    if (l.market.type === 'map_rounds_hcp' || l.market.type === 'map_rounds_total') {
+      warnings.push('Rounds: confira se as duas casas contam a prorrogação (overtime) do mesmo jeito.');
+    }
+    const quotes = legs.map((lg) => this.store.get(lg.key));
+    legs.forEach((lg, i) => {
+      const q = quotes[i];
+      const peer = quotes[1 - i];
+      if (!q || !peer) return;
+      const frozen = frozenFor(q, [peer], now, this.opts.frozenMs ?? DEFAULT_FROZEN_MS);
+      if (frozen === undefined) return;
+      lg.frozenMs = frozen;
+      warnings.push(`Odd da ${lg.book} parada há ${Math.round(frozen / 1000)}s com o jogo ao vivo: pode estar congelada.`);
+    });
 
     const opp: Opportunity = {
       id,
@@ -247,7 +266,9 @@ export class ArbitrageEngine extends EventEmitter {
     const changed =
       !prev ||
       prev.status !== status ||
-      prev.legs.some((lg, i) => lg.odds !== legs[i].odds || lg.maxStake !== legs[i].maxStake);
+      prev.legs.some(
+        (lg, i) => lg.odds !== legs[i].odds || lg.maxStake !== legs[i].maxStake || !lg.frozenMs !== !legs[i].frozenMs,
+      );
 
     this.opps.set(id, opp);
     if (changed) this.emit('opportunity', opp);

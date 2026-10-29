@@ -29,6 +29,10 @@ export interface BookHealth {
   lastDisconnectAt?: number;
   /** Duração somada das quedas */
   downtimeMs: number;
+  /** Respostas 403/challenge no último minuto (quando a fonte informa) */
+  blockedPerMin?: number;
+  /** Respostas 429 no último minuto (quando a fonte informa) */
+  rateLimitedPerMin?: number;
 }
 
 interface Track {
@@ -120,6 +124,8 @@ export class HealthMonitor {
         disconnects: t.disconnects,
         lastDisconnectAt: t.lastDisconnectAt,
         downtimeMs: t.downtimeMs,
+        blockedPerMin: s.blockedPerMin,
+        rateLimitedPerMin: s.rateLimitedPerMin,
       };
     });
   }

@@ -82,3 +82,49 @@ test('livro com spread largo não entra no consenso', () => {
   scanner.scan();
   assert.deepEqual(emitted, []);
 });
+
+test('EV exige o mínimo de casas no consenso (padrão 2)', () => {
+  const store = new OddsStore();
+  store.upsert(quote('polymarket', 'NAVI', 'FaZe', 2.0, 2.0));
+  store.upsert(quote('duel', 'NAVI', 'FaZe', 2.3, 1.6));
+  const pairs = [pair('polymarket:1', 'duel:1')];
+  const opts = { minEvPct: 2, warnEvPct: 20, maxOverroundPct: 12, commissionPct: {} };
+
+  // Só uma outra casa para a odd justa: sem EV por padrão.
+  const strict = new ValueScanner(store, () => pairs, opts);
+  strict.scan();
+  assert.equal(strict.list().length, 0);
+
+  const loose = new ValueScanner(store, () => pairs, { ...opts, minConsensusBooks: 1 });
+  loose.scan();
+  const bet = loose.list().find((b) => b.bestBook === 'duel');
+  assert.ok(bet, 'com 1 casa de consenso o EV aparece');
+  assert.ok(bet.warnings.some((w) => w.includes('única casa')));
+});
+
+test('EV avisa odd congelada ao vivo quando as outras casas se mexeram', () => {
+  const store = new OddsStore();
+  const now = Date.now();
+  const live = (q: Quote, changedAt: number): Quote => ({ ...q, startTime: now - 600_000, changedAt, updatedAt: now });
+  store.upsert(live(quote('polymarket', 'NAVI', 'FaZe', 2.0, 2.0), now - 2_000));
+  store.upsert(live(quote('thunderpick', 'NAVI', 'FaZe', 1.95, 1.95), now - 3_000));
+  store.upsert(live(quote('duel', 'NAVI', 'FaZe', 2.3, 1.6), now - 60_000));
+  // OddsStore recalcula changedAt no upsert; força o cenário de preço parado.
+  store.get('duel:1')!.changedAt = now - 60_000;
+  store.get('polymarket:1')!.changedAt = now - 2_000;
+  store.get('thunderpick:1')!.changedAt = now - 3_000;
+  const pairs = [pair('polymarket:1', 'duel:1'), pair('thunderpick:1', 'duel:1'), pair('polymarket:1', 'thunderpick:1')];
+  const scanner = new ValueScanner(store, () => pairs, { minEvPct: 2, warnEvPct: 20, maxOverroundPct: 12, commissionPct: {} });
+  scanner.scan(now);
+  const bet = scanner.list().find((b) => b.bestBook === 'duel');
+  assert.ok(bet, 'EV continua aparecendo (só é sinalizado)');
+  assert.ok(bet.books[0].frozenMs! >= 60_000);
+  assert.ok(bet.warnings.some((w) => w.includes('congelada')));
+
+  // Pré-jogo parado é normal: sem aviso.
+  for (const k of ['polymarket:1', 'thunderpick:1', 'duel:1']) store.get(k)!.startTime = now + 3600_000;
+  scanner.scan(now);
+  const pre = scanner.list().find((b) => b.bestBook === 'duel')!;
+  assert.equal(pre.books[0].frozenMs, undefined);
+  assert.ok(!pre.warnings.some((w) => w.includes('congelada')));
+});

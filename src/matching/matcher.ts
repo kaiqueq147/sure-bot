@@ -17,6 +17,17 @@ export interface MatchOptions {
   minTeamScore?: number;
 }
 
+/** Pares que o usuário marcou como errados (por `eventKey` das duas casas); padrão: nenhum. */
+let isBlocked: (a: string, b: string) => boolean = () => false;
+
+/** Define a lista de bloqueio consultada por `matchQuotes`; `undefined` desliga. */
+export function setPairBlocklist(fn?: (a: string, b: string) => boolean): void {
+  isBlocked = fn ?? (() => false);
+}
+
+/** Chave canônica de um par de eventos, independente da ordem. */
+export const pairKey = (a: string, b: string): string => (a < b ? `${a}|${b}` : `${b}|${a}`);
+
 /** Score de correspondência entre dois eventos, considerando as duas orientações possíveis. */
 export function scoreEvents(l: Quote, r: Quote, minTeam = 0.7): { score: number; swapped: boolean } | null {
   const sA = teamSimilarity(l.teamA, r.teamA);
@@ -37,9 +48,19 @@ export function scoreEvents(l: Quote, r: Quote, minTeam = 0.7): { score: number;
 export function matchQuotes(left: Quote[], right: Quote[], opts: MatchOptions): MatchPair[] {
   const candidates: Array<MatchPair & { rank: number }> = [];
 
+  // Separa a direita por jogo: cada evento só é comparado com o mesmo jogo ou com 'other'.
+  const byGame = new Map<string, Quote[]>();
+  for (const r of right) {
+    if (!byGame.has(r.game)) byGame.set(r.game, []);
+    byGame.get(r.game)!.push(r);
+  }
+  const others = byGame.get('other') ?? [];
+
   for (const l of left) {
-    for (const r of right) {
+    const pool = l.game === 'other' ? right : [...(byGame.get(l.game) ?? []), ...others];
+    for (const r of pool) {
       if (!gamesCompatible(l.game, r.game)) continue;
+      if (isBlocked(l.eventKey, r.eventKey)) continue;
       let startPenalty = 0;
       if (l.startTime && r.startTime) {
         const diff = Math.abs(l.startTime - r.startTime);
