@@ -290,22 +290,37 @@ export function pickSportLineMarkets(events: GammaEvent[], teamA: string, teamB:
 export function pickSoccer1x2(ev: GammaEvent): { teamA: string; teamB: string; entry: Entry } | null {
   const [home, away] = ev.title.split(/\s+vs\.?\s+/i).map((t) => t.trim());
   if (!home || !away) return null;
+  const entry = pickThreeWay(ev.markets ?? [], 'moneyline', home, away, WINNER);
+  return entry ? { teamA: home, teamB: away, entry } : null;
+}
+
+/**
+ * Resultado no intervalo (1X2 do 1º tempo): mesmo formato do 1X2, no evento irmão
+ * "<jogo> - Halftime Result" ("X leading at halftime?", "Draw at halftime?"). Vira `result3`.
+ */
+export function pickHalftime1x2(events: GammaEvent[], home: string, away: string): Entry | null {
+  const markets = events.flatMap((e) => e.markets ?? []);
+  return pickThreeWay(markets, 'soccer_halftime_result', home, away, { type: 'result3', period: 'h1' });
+}
+
+/** Três mercados Sim/Não (casa, empate, fora) de um `sportsMarketType`: os tokens "Sim" de cada. */
+function pickThreeWay(markets: GammaMarket[], type: string, home: string, away: string, spec: MarketSpec): Entry | null {
   const yes = (m: GammaMarket) => {
     const outcomes = parseList(m.outcomes).map(norm);
     const tokens = parseList(m.clobTokenIds);
     const i = outcomes.indexOf('yes');
     return outcomes.length === 2 && tokens.length === 2 && i >= 0 ? tokens[i] : undefined;
   };
-  const ml = (ev.markets ?? []).filter((m) => m.sportsMarketType === 'moneyline' && tradable(m));
-  if (ml.length !== 3) return null;
-  const draw = ml.find((m) => /^draw\b/i.test(m.groupItemTitle ?? '') || /\bdraw\?/i.test(m.question ?? ''));
-  const team = (name: string) => ml.find((m) => m !== draw && norm(m.groupItemTitle ?? '') === norm(name));
+  const ms = markets.filter((m) => m.sportsMarketType === type && tradable(m));
+  if (ms.length !== 3) return null;
+  const draw = ms.find((m) => /^draw\b/i.test(m.groupItemTitle ?? '') || /\bdraw\b/i.test(m.question ?? ''));
+  const team = (name: string) => ms.find((m) => m !== draw && norm(m.groupItemTitle ?? '') === norm(name));
   const mh = team(home);
   const ma = team(away);
   if (!draw || !mh || !ma) return null;
   const [tokenA, tokenB, tokenDraw] = [yes(mh), yes(ma), yes(draw)];
   if (!tokenA || !tokenB || !tokenDraw) return null;
-  return { teamA: home, teamB: away, entry: { market: mh, spec: WINNER, tokenA, tokenB, tokenDraw } };
+  return { market: mh, spec, tokenA, tokenB, tokenDraw };
 }
 
 /** Mesmo critério de `stake.ts`: tipo/período que `markets.ts` ainda não distingue fica de fora. */
@@ -434,8 +449,9 @@ export class PolymarketSource implements Source {
           url: `https://polymarket.com/event/${ev.slug}`,
         };
         for (const e of entries) {
-          // O 1X2 junta três mercados: a chave é o evento, não um mercado.
-          const marketId = e.tokenDraw ? `1x2:${ev.id}` : String(e.market.id);
+          // O 1X2 junta três mercados: a chave é o evento, não um mercado. O `result3` (intervalo)
+          // usa o id do mercado do mandante, que é único.
+          const marketId = e.tokenDraw && e.spec.type === 'winner' ? `1x2:${ev.id}` : String(e.market.id);
           if (seen.has(marketId)) continue;
           seen.add(marketId);
           if (this.markets.has(marketId)) continue;
@@ -529,6 +545,10 @@ export class PolymarketSource implements Source {
       const start = toEpoch(winner.market.gameStartTime) ?? toEpoch(winner.market.eventStartTime) ?? toEpoch(ev.startTime);
       if (start !== undefined && start > horizon) continue;
       const lines = pickSportLineMarkets([ev, ...siblings], teamA, teamB).filter((e) => marketKeySupported(e.spec));
+      if (hasDraw(game)) {
+        const ht = pickHalftime1x2([ev, ...siblings], teamA, teamB);
+        if (ht && marketKeySupported(ht.spec)) lines.push(ht);
+      }
       out.push({ ev, teamA, teamB, eventKey: `polymarket:${winner.tokenDraw ? `1x2:${ev.id}` : winner.market.id}`, game, start, entries: [winner, ...lines] });
     }
     return out;

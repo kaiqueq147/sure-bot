@@ -188,3 +188,18 @@ test('rematch com milhares de jogos de futebol usa a janela de horário', () => 
   assert.ok(derivedPairs(pairs, left, right).length === 0);
   console.log(`matchQuotes 5000x5000 futebol: ${ms.toFixed(0)}ms`);
 });
+
+test('ttlMs do quote substitui a TTL da casa (pré-jogo buscado com menos frequência)', () => {
+  const store = new OddsStore();
+  store.setTtl('cloudbet', 20_000);
+  const base = {
+    eventKey: 'cloudbet:1', market: { type: 'winner' as const }, book: 'cloudbet' as const, marketId: '1',
+    game: 'basketball' as const, eventName: 'A vs B', teamA: 'A', teamB: 'B', oddsA: 1.9, oddsB: 1.9, url: '',
+  };
+  const now = Date.now();
+  const live: Quote = { ...base, key: 'cloudbet:1', updatedAt: now - 60_000 };
+  const prematch: Quote = { ...base, key: 'cloudbet:2', eventKey: 'cloudbet:2', updatedAt: now - 60_000, ttlMs: 130_000 };
+  assert.equal(store.isFresh(live, now), false, 'sem ttlMs vale a TTL da casa (20s)');
+  assert.equal(store.isFresh(prematch, now), true, 'com ttlMs o pré-jogo de 60s ainda vale');
+  assert.equal(store.isFresh({ ...prematch, updatedAt: now - 140_000 }, now), false);
+});

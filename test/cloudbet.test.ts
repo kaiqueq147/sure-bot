@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CloudbetSource, cloudbetMarkets, cloudbetSportMarkets } from '../src/sources/cloudbet.js';
+import { CloudbetSource, cloudbetMarkets, cloudbetSportMarkets, traditionalMarketKeys } from '../src/sources/cloudbet.js';
 import { OddsStore } from '../src/core/OddsStore.js';
 
 const sel = (outcome: string, params: string, price: number, status = 'SELECTION_ENABLED') => ({ outcome, params, price, status, maxStake: 100 });
@@ -117,4 +117,33 @@ test('busca de eSports não apaga os eventos de esportes tradicionais (e vice-ve
   src.ingest({ sports: [] }, false, 'sports');
   assert.equal(store.get('cloudbet:9'), undefined, 'a busca de esportes poda os seus próprios eventos');
   assert.ok(store.get('cloudbet:1'), 'e não mexe nos eSports');
+});
+
+test('3 vias: 1X2 do 1º tempo do futebol e 1X2 regulamentar do basquete viram result3', () => {
+  const base = { id: 9, home: { name: 'Home' }, away: { name: 'Away' }, status: 'TRADING' };
+  const soccer = cloudbetSportMarkets('soccer', {
+    ...base,
+    markets: { 'soccer.match_odds_period_first_half': sub([sel('home', '', 3.2), sel('draw', '', 2.0), sel('away', '', 4.1)]) },
+  });
+  const h1 = soccer.find((m) => m.spec.type === 'result3');
+  assert.deepEqual(h1?.spec, { type: 'result3', period: 'h1' });
+  assert.deepEqual([h1?.a, h1?.draw, h1?.b], [3.2, 2.0, 4.1]);
+
+  const nba = cloudbetSportMarkets('basketball', {
+    ...base,
+    markets: {
+      'basketball.moneyline': sub([sel('home', '', 1.5), sel('away', '', 2.6)]),
+      'basketball.1x2': sub([sel('home', '', 1.6), sel('draw', '', 14), sel('away', '', 2.7)]),
+    },
+  });
+  assert.equal(nba.find((m) => m.spec.type === 'winner')?.draw, undefined, 'moneyline segue 2 vias');
+  assert.deepEqual(nba.find((m) => m.spec.type === 'result3')?.spec, { type: 'result3' });
+  assert.equal(nba.find((m) => m.spec.type === 'result3')?.draw, 14);
+});
+
+test('nunca pede mais de 7 mercados por esporte (a API responde 400 acima disso)', () => {
+  for (const sport of ['soccer', 'basketball', 'baseball', 'tennis', 'american-football']) {
+    assert.ok(traditionalMarketKeys(sport).length <= 7, sport);
+  }
+  assert.ok(traditionalMarketKeys('soccer').includes('match_odds_period_first_half'), '1X2 do 1º tempo continua');
 });

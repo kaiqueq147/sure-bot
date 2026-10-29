@@ -128,6 +128,8 @@ const SPORT_MARKETS: Partial<Record<Game, SportMarketIds>> = {
 };
 /** 1º tempo do futebol: 1X2 (60), handicap (66), total (68) */
 const SOCCER_H1: SportMarketIds = { winner3: '60', hcp: '66', tot: '68' };
+/** Resultado no tempo regulamentar (basquete/futebol americano): 1X2, outcomes 1/2/3 */
+const REGULATION_RESULT_MARKET = '1';
 /** Ambas marcam: outcomes 74 = sim, 76 = não */
 const BTTS_MARKET = '29';
 /** Empate anula: outcomes 4 = casa, 5 = fora */
@@ -145,6 +147,11 @@ export const PERIOD_SAFE =
   !sameMarket({ type: 'total', line: 1.5, period: 'h1' }, { type: 'total', line: 1.5 }) &&
   // O vencedor usa a própria eventKey como chave: o de um período precisa de outra.
   derivedQuoteFields('e', { type: 'winner', period: 'set1' }, 'a', 'b').key !== 'e';
+/** `result3` só sai quando o núcleo lhe dá chave própria (senão colidiria com o vencedor). */
+export const RESULT3_SAFE =
+  marketKey({ type: 'result3' }) !== marketKey({ type: 'winner' }) &&
+  marketKey({ type: 'result3', period: 'h1' }) !== marketKey({ type: 'result3' }) &&
+  !sameMarket({ type: 'result3' }, { type: 'winner' });
 export const PROPS_SAFE =
   marketKey({ type: 'btts' }) !== marketKey({ type: 'dnb' }) &&
   marketKey({ type: 'btts' }) !== 'win' &&
@@ -263,8 +270,10 @@ export function sportMarkets(ev: BetbyEvent, game: Game): SportOdds[] {
   const block = (m: SportMarketIds, period?: MarketSpec['period']) => {
     const spec: MarketSpec = period ? { type: 'winner', period } : WINNER;
     if (m.winner3) {
+      // 1X2 de período não é âncora: vira `result3` (3 vias com empate).
       const w = threeWay(first(m.winner3));
-      if (w) out.push({ ...w, spec });
+      if (w && !period) out.push({ ...w, spec });
+      else if (w && RESULT3_SAFE) out.push({ ...w, spec: { type: 'result3', period } });
     } else if (m.winner) {
       const w = first(m.winner);
       const odds = w ? pairOdds(w['4'], w['5']) : null;
@@ -285,6 +294,11 @@ export function sportMarkets(ev: BetbyEvent, game: Game): SportOdds[] {
       const d = dnb ? pairOdds(dnb['4'], dnb['5']) : null;
       if (d) out.push({ ...d, spec: { type: 'dnb' } });
     }
+  }
+  if ((game === 'basketball' || game === 'american_football') && RESULT3_SAFE) {
+    // Sem prorrogação o empate é possível: 3 vias, separado do vencedor (219, com prorrogação).
+    const reg = threeWay(first(REGULATION_RESULT_MARKET));
+    if (reg) out.push({ ...reg, spec: { type: 'result3' } });
   }
   if (game === 'tennis' && PERIOD_SAFE) {
     const set1 = ev.markets?.[TENNIS_SET_WINNER_MARKET]?.['setnr=1'];

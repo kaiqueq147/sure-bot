@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import type { OddsStore } from '../core/OddsStore.js';
 import { createLogger } from '../core/logger.js';
-import { isHandicapType, isOrderIndependent, marketLabel, sameMarket } from '../core/markets.js';
+import { isHandicapType, isOrderIndependent, isThreeWayType, marketLabel, sameMarket } from '../core/markets.js';
 import { matchQuotes, type MatchPair } from '../matching/matcher.js';
 import type { BookId, ClosedReason, Leg, Opportunity, Quote } from '../types.js';
 import { arbMargin, effectiveOdds, frozenFor, profitPct } from './math.js';
@@ -25,8 +25,11 @@ const REOPEN_GRACE_MS = 15_000;
 /** Âncora do pareamento: o vencedor do jogo inteiro (`key === eventKey`). */
 export const isAnchor = (q: Quote): boolean => q.key === q.eventKey;
 
-/** Mercado de 3 vias (1X2 com empate): duas pernas não cobrem o resultado. */
-export const isThreeWay = (q: Quote): boolean => q.oddsDraw != null;
+/**
+ * Mercado de 3 vias (1X2 com empate, `result3`): duas pernas não cobrem o resultado. O tipo conta
+ * mesmo com o empate suspenso (`oddsDraw` nulo), senão o mercado viraria "2 vias" por engano.
+ */
+export const isThreeWay = (q: Quote): boolean => q.oddsDraw != null || isThreeWayType(q.market.type);
 
 /**
  * Pareia handicaps e totais a partir dos jogos já pareados pelo vencedor: mesmo tipo e mesma

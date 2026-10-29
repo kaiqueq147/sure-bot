@@ -157,3 +157,18 @@ test('esportes tradicionais: 1X2 do futebol com empate e linhas x.5; basquete us
   assert.deepEqual(b.find((m) => m.spec.type === 'winner')?.draw, undefined, 'basquete é 2 vias');
   assert.deepEqual(b.filter((m) => m.spec.type === 'handicap').map((m) => m.spec.line), [-6.5], 'ignora o handicap de tempo regulamentar (16)');
 });
+
+test('3 vias: 1X2 do 1º tempo (60) e resultado no tempo regulamentar (1) do basquete viram result3', () => {
+  const desc = (sport: string) => ({ ...event('1', '1').desc!, sport });
+  const soccer = sportMarkets({ desc: desc('1'), markets: { '60': { '': { '1': { k: '3.1' }, '2': { k: '2.05' }, '3': { k: '3.9' } } } } }, 'soccer');
+  const h1 = soccer.find((m) => m.spec.type === 'result3');
+  assert.deepEqual(h1?.spec, { type: 'result3', period: 'h1' });
+  assert.deepEqual([h1?.a, h1?.draw, h1?.b], [3.1, 2.05, 3.9]);
+  assert.equal(soccer.some((m) => m.spec.type === 'winner'), false, '1X2 de período não vira âncora');
+
+  const nba = sportMarkets({ desc: desc('2'), markets: { '1': { '': { '1': { k: '1.6' }, '2': { k: '15' }, '3': { k: '2.4', b: 1 } } } } }, 'basketball');
+  const reg = nba.find((m) => m.spec.type === 'result3');
+  assert.deepEqual(reg?.spec, { type: 'result3' });
+  assert.equal(reg?.draw, 15);
+  assert.equal(reg?.suspended, true, 'fora bloqueado suspende o mercado');
+});

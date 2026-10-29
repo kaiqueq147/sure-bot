@@ -1,9 +1,9 @@
 import { EventEmitter } from 'node:events';
 import type { OddsStore } from '../core/OddsStore.js';
-import { marketLabel } from '../core/markets.js';
+import { drawLabel, marketLabel } from '../core/markets.js';
 import type { MatchPair } from '../matching/matcher.js';
 import type { BookId, ClosedReason, Leg, Opportunity, Quote } from '../types.js';
-import { isAnchor, isThreeWay } from './ArbitrageEngine.js';
+import { isThreeWay } from './ArbitrageEngine.js';
 import { effectiveOdds, frozenFor, profitPct } from './math.js';
 import { orient, OUTCOMES, sideOf, type Outcome, type ThreeWayMember } from './threeWay.js';
 import { buildGroups } from './ValueScanner.js';
@@ -21,8 +21,10 @@ const DEFAULT_FROZEN_MS = 30_000;
 const REOPEN_GRACE_MS = 15_000;
 
 /**
- * Arbitragem de 3 vias (futebol 1X2): para cada jogo pareado entre as casas (pares de vencedor
- * dos motores de 2 vias), pega a melhor odd de casa, empate e fora entre todas as casas.
+ * Arbitragem de 3 vias: 1X2 do futebol (âncora) e `result3` (1X2 de período, tempo regulamentar).
+ * Para cada mercado pareado entre as casas (pares dos motores de 2 vias, âncoras e derivados),
+ * pega a melhor odd de casa, empate e fora entre todas as casas. Cada mercado é um grupo próprio:
+ * as chaves dos quotes diferem por mercado/período, então 1º tempo nunca se mistura com o jogo inteiro.
  * Margem 1/casa + 1/empate + 1/fora < 1 = lucro garantido com três apostas.
  *
  * Mesma API de eventos do ArbitrageEngine: `opportunity` (Opportunity) e `closed` (id, reason).
@@ -66,18 +68,18 @@ export class ThreeWayEngine extends EventEmitter {
     });
   }
 
-  /** Grupos de jogos com 1X2 em 2+ casas: só pares de âncoras de 3 vias. */
+  /** Grupos de mercados de 3 vias em 2+ casas (1X2 âncora ou `result3` derivado). */
   private groups(): Array<{ id: string; score: number; members: Array<{ key: string; flip: boolean }> }> {
-    const anchors = this.pairs().filter((p) => {
+    const threeWay = this.pairs().filter((p) => {
       const l = this.store.get(p.leftKey);
       const r = this.store.get(p.rightKey);
-      return !!l && !!r && isAnchor(l) && isAnchor(r) && isThreeWay(l) && isThreeWay(r);
+      return !!l && !!r && isThreeWay(l) && isThreeWay(r);
     });
     const scoreOf = new Map<string, number>();
-    for (const p of anchors) {
+    for (const p of threeWay) {
       for (const k of [p.leftKey, p.rightKey]) scoreOf.set(k, Math.min(scoreOf.get(k) ?? 1, p.score));
     }
-    return buildGroups(anchors, (k) => this.store.get(k)?.book).map((g) => ({
+    return buildGroups(threeWay, (k) => this.store.get(k)?.book).map((g) => ({
       ...g,
       score: Math.min(...g.members.map((m) => scoreOf.get(m.key) ?? 1)),
     }));
@@ -140,7 +142,7 @@ export class ThreeWayEngine extends EventEmitter {
       side,
       marketId: q.marketId,
       // Nome como aparece no site da casa onde a perna é apostada.
-      selection: side === 'D' ? 'Empate' : side === 'A' ? q.teamA : q.teamB,
+      selection: side === 'D' ? drawLabel(q.market, q.game) : side === 'A' ? (q.selA ?? q.teamA) : (q.selB ?? q.teamB),
       odds: m.odds[o],
       effectiveOdds: eff,
       maxStake: side === 'A' ? q.maxStakeA : side === 'B' ? q.maxStakeB : q.maxStakeDraw,

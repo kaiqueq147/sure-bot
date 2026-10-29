@@ -1,3 +1,4 @@
+import { drawLabel } from '../core/markets.js';
 import type { Quote } from '../types.js';
 
 /** Resultado de um 1X2 do ponto de vista do grupo (time A do grupo = casa). */
@@ -37,8 +38,8 @@ export function fairProbs3(odds: Record<Outcome, number>): Record<Outcome, numbe
   return { home: 1 / odds.home / sum, draw: 1 / odds.draw / sum, away: 1 / odds.away / sum };
 }
 
-/** Rótulo da seleção de um resultado, com os nomes de times do quote de referência. */
+/** Rótulo da seleção de um resultado (com período/tempo regulamentar quando o mercado tem). */
 export function outcomeLabel(outcome: Outcome, ref: Quote): string {
-  if (outcome === 'draw') return 'Empate';
-  return outcome === 'home' ? ref.teamA : ref.teamB;
+  if (outcome === 'draw') return drawLabel(ref.market, ref.game);
+  return outcome === 'home' ? (ref.selA ?? ref.teamA) : (ref.selB ?? ref.teamB);
 }

@@ -33,7 +33,14 @@ export type MarketType =
   /** Ambas marcam (futebol): lado A = sim, lado B = não */
   | 'btts'
   /** Empate anula (futebol): 2 vias, devolve no empate; só pareia com outro `dnb` */
-  | 'dnb';
+  | 'dnb'
+  /**
+   * Resultado de 3 vias que NÃO é a âncora do evento: 1X2 de um período no futebol (`period: 'h1'`)
+   * e resultado no tempo regulamentar de basquete/futebol americano (sem `period`; empate possível
+   * porque a prorrogação não conta). Odds em oddsA (casa) / oddsDraw / oddsB (fora); sempre com
+   * `oddsDraw`, então só o motor de 3 vias o usa. Pareia como o vencedor (troca o lado, sem linha).
+   */
+  | 'result3';
 
 /**
  * Mercado de 2 vias da série. Handicap: `line` é a linha do teamA (ex: −1.5) e o teamB tem −line.
@@ -79,7 +86,7 @@ export interface Quote {
   oddsA: number | null;
   oddsB: number | null;
   /**
-   * Só no `winner` de esportes com empate (futebol 1X2). Com ele presente o mercado é de 3 vias:
+   * No `winner` de esportes com empate (futebol 1X2) e em todo `result3`. Com ele o mercado é de 3 vias:
    * o motor de 2 vias ignora o quote e o de 3 vias usa A/empate/B. O quote continua sendo a
    * âncora do pareamento (`key === eventKey`).
    */
@@ -97,6 +104,8 @@ export interface Quote {
   url: string;
   /** epoch ms da última atualização de preço */
   updatedAt: number;
+  /** Validade própria (ms), no lugar da TTL da casa: ex. pré-jogo buscado com menos frequência */
+  ttlMs?: number;
   /** epoch ms em que odds/suspensão mudaram pela última vez (definido pelo OddsStore) */
   changedAt?: number;
 }

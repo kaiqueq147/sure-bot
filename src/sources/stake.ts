@@ -221,10 +221,10 @@ export function buildStakeSportsQuery(sports: string[], type: "live" | "upcoming
 }
 
 type Period = NonNullable<MarketSpec["period"]>;
-/** teams = casa/fora; ou = mais/menos; yesno = sim/não */
+/** teams = casa/fora; ou = mais/menos; yesno = sim/não; three = casa/empate/fora (`result3`) */
 interface TradTemplate {
   type: MarketType;
-  sel: "teams" | "ou" | "yesno";
+  sel: "teams" | "ou" | "yesno" | "three";
   period?: Period;
   /** specifier exigido (ex.: só o 1º quarto) */
   only?: [string, string];
@@ -249,6 +249,10 @@ const TRAD_TEMPLATES: Record<string, Record<string, TradTemplate>> = {
     "68": { type: "total", sel: "ou", period: "h1" },
     "303": { type: "handicap", sel: "teams", period: "q1", only: ["quarternr", "1"] },
     "236": { type: "total", sel: "ou", period: "q1", only: ["quarternr", "1"] },
+    // 3 vias (empate possível): tempo regulamentar, 1º tempo e 1º quarto
+    "1": { type: "result3", sel: "three" },
+    "60": { type: "result3", sel: "three", period: "h1" },
+    "235": { type: "result3", sel: "three", period: "q1", only: ["quarternr", "1"] },
   },
   baseball: {
     "251": { type: "winner", sel: "teams" },
@@ -270,8 +274,19 @@ TRAD_TEMPLATES["american-football"] = TRAD_TEMPLATES.basketball;
 
 type SportOdds = TwoWayOdds & { spec: MarketSpec; draw?: number | null };
 
+/** 1X2: casa/fora pelo nome (não pela posição) e o empate ("Draw"); suspenso se faltar preço. */
+function threeWayOdds(m: StakeMarket, home: string, away: string): (TwoWayOdds & { draw: number | null }) | null {
+  const draw = m.outcomes.find((o) => /^draw$/i.test(o.name.trim()));
+  const teams = m.outcomes.filter((o) => o !== draw);
+  if (!draw || teams.length !== 2) return null;
+  const odds = pairOdds(m, ...homeAway({ ...m, outcomes: teams }, home, away));
+  if (!odds) return null;
+  const d = m.status === "active" && Number.isFinite(draw.odds) && draw.odds > 1 ? draw.odds : null;
+  return { ...odds, suspended: odds.suspended || !draw.active || d === null, draw: d };
+}
+
 /**
- * Mercados de 2 vias (e o 1X2 do futebol, com `draw`) de um jogo de esporte tradicional.
+ * Mercados de 2 vias (e os de 3 vias, com `draw`) de um jogo de esporte tradicional.
  * Handicap: `hcp=<linha da casa>`; total: `total=<linha>`. Só linhas x.5.
  */
 export function stakeSportMarkets(sport: string, fx: StakeFixture): SportOdds[] {
@@ -288,14 +303,8 @@ export function stakeSportMarkets(sport: string, fx: StakeFixture): SportOdds[] 
 
   if (sport === "soccer") {
     for (const m of markets("1")) {
-      const draw = m.outcomes.find((o) => /^draw$/i.test(o.name.trim()));
-      const teams = m.outcomes.filter((o) => o !== draw);
-      if (!draw || teams.length !== 2) continue;
-      const fake = { ...m, outcomes: teams };
-      const odds = pairOdds(m, ...homeAway(fake, home, away));
-      if (!odds) continue;
-      const d = m.status === "active" && Number.isFinite(draw.odds) && draw.odds > 1 ? draw.odds : null;
-      out.push({ ...odds, suspended: odds.suspended || !draw.active || d === null, draw: d, spec: WINNER });
+      const odds = threeWayOdds(m, home, away);
+      if (odds) out.push({ ...odds, spec: WINNER });
     }
   }
 
@@ -306,6 +315,11 @@ export function stakeSportMarkets(sport: string, fx: StakeFixture): SportOdds[] 
       const side = (re: RegExp) => m.outcomes.find((o) => re.test(o.name.trim()));
       let line: number | undefined;
       let odds: TwoWayOdds | null;
+      if (tpl.sel === "three") {
+        const three = threeWayOdds(m, home, away);
+        if (three) out.push({ ...three, spec: tpl.period ? { type: tpl.type, period: tpl.period } : { type: tpl.type } });
+        continue;
+      }
       if (tpl.sel === "ou") {
         line = Number(spec.total);
         if (!isHalfLine(line)) continue;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { pickSoccer1x2, pickSportLineMarkets, sportOf, type GammaEvent } from '../src/sources/polymarket.js';
+import { pickHalftime1x2, pickSoccer1x2, pickSportLineMarkets, sportOf, type GammaEvent } from '../src/sources/polymarket.js';
 
 const yesNo = (id: string, extra: Record<string, unknown>) => ({
   id,
@@ -68,4 +68,22 @@ test('tênis: total de games e vencedor do 1º set; NBA vira basquete', () => {
   const got = pickSportLineMarkets([ev], 'Player A', 'Player B').map((e) => `${e.spec.type}@${e.spec.period ?? ''}:${e.tokenA}`);
   assert.deepEqual(got, ['total@:o', 'winner@set1:a']);
   assert.equal(sportOf({ id: 4, slug: 'x', title: 'Cavaliers vs. Hawks', tags: [{ slug: 'nba' }] }), 'basketball');
+});
+
+test('futebol: resultado no intervalo (evento irmão) vira result3 do 1º tempo', () => {
+  const ht: GammaEvent = {
+    id: 2,
+    slug: 'lal-vil-esp-2026-10-30-halftime-result',
+    title: 'Villarreal CF vs. RCD Espanyol de Barcelona - Halftime Result',
+    tags: [{ slug: 'soccer' }],
+    markets: [
+      yesNo('hh', { sportsMarketType: 'soccer_halftime_result', groupItemTitle: 'Villarreal CF', question: 'Villarreal CF leading at halftime?' }),
+      yesNo('hd', { sportsMarketType: 'soccer_halftime_result', groupItemTitle: 'Draw', question: 'Villarreal CF vs. RCD Espanyol de Barcelona: Draw at halftime?' }),
+      yesNo('ha', { sportsMarketType: 'soccer_halftime_result', groupItemTitle: 'RCD Espanyol de Barcelona', question: 'RCD Espanyol de Barcelona leading at halftime?' }),
+    ],
+  };
+  const e = pickHalftime1x2([ht], 'Villarreal CF', 'RCD Espanyol de Barcelona')!;
+  assert.deepEqual(e.spec, { type: 'result3', period: 'h1' });
+  assert.deepEqual([e.tokenA, e.tokenDraw, e.tokenB], ['hh-yes', 'hd-yes', 'ha-yes']);
+  assert.equal(pickHalftime1x2([{ ...ht, markets: ht.markets!.slice(0, 2) }], 'Villarreal CF', 'RCD Espanyol de Barcelona'), null, 'precisa dos três');
 });

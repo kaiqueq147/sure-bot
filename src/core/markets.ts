@@ -10,6 +10,8 @@ export const isHalfLine = (line: number): boolean => Number.isFinite(line) && Ma
 export const isHandicapType = (t: MarketType): boolean => t === 'handicap' || t === 'map_rounds_hcp' || t === 'map_kills_hcp';
 /** Totais (mais/menos): não dependem da ordem dos times. */
 export const isTotalType = (t: MarketType): boolean => t === 'total' || t === 'map_rounds_total' || t === 'map_kills_total';
+/** Resultado de 3 vias que não é a âncora (1X2 de período, tempo regulamentar): troca o lado como o vencedor. */
+export const isThreeWayType = (t: MarketType): boolean => t === 'result3';
 /** Mercados cujos lados não são os times (mais/menos, sim/não): a ordem dos times não troca o lado. */
 export const isOrderIndependent = (t: MarketType): boolean => isTotalType(t) || t === 'btts';
 
@@ -52,6 +54,7 @@ function baseKey(spec: MarketSpec): string {
   if (spec.type === 'map') return `map:${spec.line}`;
   if (spec.type === 'btts') return 'btts';
   if (spec.type === 'dnb') return 'dnb';
+  if (spec.type === 'result3') return 'r3';
   const per = PER_MAP[spec.type];
   if (per) return `${per.key}:${spec.map}:${spec.line}`;
   return 'win';
@@ -81,11 +84,25 @@ function baseLabel(spec: MarketSpec, game?: Game): string {
   if (spec.type === 'map') return `Vencedor do mapa ${spec.line}`;
   if (spec.type === 'btts') return 'Ambas marcam';
   if (spec.type === 'dnb') return 'Empate anula';
+  if (spec.type === 'result3') return isRegulation(spec, game) ? 'Resultado no tempo regulamentar (1X2)' : 'Resultado (1X2)';
   const per = PER_MAP[spec.type];
   if (per) return `Mapa ${spec.map}: ${per.label} ${isHandicapType(spec.type) ? fmtLine(spec.line!) : spec.line}`;
   // 1X2 tem as 3 seleções; nos demais esportes é a moneyline.
   if (game && isSport(game)) return game === 'soccer' ? 'Resultado final (1X2)' : 'Vencedor (moneyline)';
   return 'Vencedor da partida';
+}
+
+/**
+ * `result3` sem período fora do futebol = resultado no tempo regulamentar (a prorrogação não conta,
+ * por isso existe empate). No futebol o 1X2 do jogo inteiro é a âncora, não um `result3`.
+ */
+const isRegulation = (spec: MarketSpec, game?: Game): boolean =>
+  spec.type === 'result3' && !spec.period && !!game && game !== 'soccer' && isSport(game);
+
+/** Rótulo da seleção de empate de um mercado de 3 vias (1X2 âncora ou `result3`). */
+export function drawLabel(spec: MarketSpec, game?: Game): string {
+  if (spec.period) return `Empate (${PERIODS[spec.period]})`;
+  return isRegulation(spec, game) ? 'Empate (tempo regulamentar)' : 'Empate';
 }
 
 /** `game` define a unidade de handicap/total (mapas, gols, pontos, runs, games). */
@@ -110,6 +127,7 @@ function baseSelections(spec: MarketSpec, teamA: string, teamB: string, game?: G
   if (spec.type === 'total') return [`Mais de ${spec.line} ${unit}`, `Menos de ${spec.line} ${unit}`];
   if (spec.type === 'btts') return ['Ambas marcam: sim', 'Ambas marcam: não'];
   if (spec.type === 'dnb') return [`${teamA} (empate anula)`, `${teamB} (empate anula)`];
+  if (isRegulation(spec, game)) return [`${teamA} (tempo regulamentar)`, `${teamB} (tempo regulamentar)`];
   if (spec.type === 'map') return [`${teamA} (mapa ${spec.line})`, `${teamB} (mapa ${spec.line})`];
   const per = PER_MAP[spec.type];
   if (per && isHandicapType(spec.type))

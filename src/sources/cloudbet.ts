@@ -5,7 +5,7 @@ import { backoffDelay, createLogger, sleep } from '../core/logger.js';
 import { Ewma } from '../core/Health.js';
 import { derivedQuoteFields, isHalfLine, isMapNumber, WINNER } from '../core/markets.js';
 import { NetStats } from './netStats.js';
-import { PERIOD_SAFE, PROPS_SAFE } from './betby.js';
+import { PERIOD_SAFE, PROPS_SAFE, RESULT3_SAFE } from './betby.js';
 import type { Game, MarketSpec, Quote, Source, SourceStatus } from '../types.js';
 
 /**
@@ -111,12 +111,14 @@ export const CLOUDBET_TRADITIONAL_SPORTS: Record<string, Game> = {
 interface SportMarketKeys {
   winner?: string;
   winner3?: string;
+  /** 1X2 no tempo regulamentar (home/draw/away, `period=ft`): vira `result3` */
+  reg3?: string;
   hcp: string;
   tot: string;
 }
 const TRADITIONAL_MARKETS: Record<string, SportMarketKeys> = {
   soccer: { winner3: 'match_odds', hcp: 'asian_handicap', tot: 'total_goals' },
-  basketball: { winner: 'moneyline', hcp: 'handicap', tot: 'totals' },
+  basketball: { winner: 'moneyline', reg3: '1x2', hcp: 'handicap', tot: 'totals' },
   'american-football': { winner: 'moneyline', hcp: 'handicap', tot: 'totals' },
   baseball: { winner: 'moneyline', hcp: 'run_line', tot: 'totals' },
   tennis: { winner: 'winner', hcp: 'game_handicap', tot: 'total_games' },
@@ -129,16 +131,23 @@ const SOCCER_H1: SportMarketKeys = {
 const SOCCER_BTTS = 'both_teams_to_score';
 const SOCCER_DNB = 'draw_no_bet';
 
-/** Mercados pedidos na URL para um esporte tradicional. */
-function traditionalMarketKeys(sport: string): string[] {
+/** A API recusa a requisição inteira (400 "too many markets requested per sport") acima disto. */
+const MAX_MARKETS_PER_SPORT = 7;
+
+/**
+ * Mercados pedidos na URL para um esporte tradicional, em ordem de prioridade e cortados em
+ * MAX_MARKETS_PER_SPORT. No futebol o empate anula (último) fica de fora: só pareia com outro dnb.
+ */
+export function traditionalMarketKeys(sport: string): string[] {
   const m = TRADITIONAL_MARKETS[sport];
   if (!m) return [];
   const keys = [m.winner, m.winner3, m.hcp, m.tot];
+  if (m.reg3 && RESULT3_SAFE) keys.push(m.reg3);
   if (sport === 'soccer') {
     if (PERIOD_SAFE) keys.push(SOCCER_H1.winner3, SOCCER_H1.hcp, SOCCER_H1.tot);
     if (PROPS_SAFE) keys.push(SOCCER_BTTS, SOCCER_DNB);
   }
-  return keys.filter((k): k is string => !!k);
+  return keys.filter((k): k is string => !!k).slice(0, MAX_MARKETS_PER_SPORT);
 }
 /** Um evento some do store se nenhum dos dois ciclos o trouxer por este tempo. */
 const FORGET_MS = 60_000;
@@ -247,22 +256,27 @@ export function cloudbetSportMarkets(sport: string, ev: CloudbetEvent): Cloudbet
       if (odds) out.push({ ...odds, spec: period ? { type, line, period } : { type, line } });
     }
   };
+  /** 1X2 (home/draw/away): suspenso se faltar o preço de qualquer seleção. */
+  const threeWay = (market: string, spec: MarketSpec) => {
+    const sels = selections(market);
+    const two = pairOdds(find(sels, 'home'), find(sels, 'away'));
+    const d = find(sels, 'draw');
+    if (!two || !d) return;
+    const draw = Number.isFinite(d.price) && d.price > 1 ? d.price : null;
+    out.push({
+      ...two,
+      draw,
+      maxDraw: d.maxStake,
+      suspended: two.suspended || d.status !== 'SELECTION_ENABLED' || draw === null,
+      spec,
+    });
+  };
   const block = (m: SportMarketKeys, period?: MarketSpec['period']) => {
     const spec: MarketSpec = period ? { type: 'winner', period } : WINNER;
     if (m.winner3) {
-      const sels = selections(m.winner3);
-      const two = pairOdds(find(sels, 'home'), find(sels, 'away'));
-      const d = find(sels, 'draw');
-      if (two && d) {
-        const draw = Number.isFinite(d.price) && d.price > 1 ? d.price : null;
-        out.push({
-          ...two,
-          draw,
-          maxDraw: d.maxStake,
-          suspended: two.suspended || d.status !== 'SELECTION_ENABLED' || draw === null,
-          spec,
-        });
-      }
+      // O 1X2 do jogo inteiro é a âncora; o de um período vira `result3`.
+      if (!period) threeWay(m.winner3, spec);
+      else if (RESULT3_SAFE) threeWay(m.winner3, { type: 'result3', period });
     } else if (m.winner) {
       const sels = selections(m.winner);
       // Moneyline com empate (tempo regulamentar) não é de 2 vias: não dá para cobrir com duas apostas.
@@ -276,6 +290,7 @@ export function cloudbetSportMarkets(sport: string, ev: CloudbetEvent): Cloudbet
   };
 
   block(keys);
+  if (keys.reg3 && RESULT3_SAFE) threeWay(keys.reg3, { type: 'result3' });
   if (sport === 'soccer') {
     if (PERIOD_SAFE) block(SOCCER_H1, 'h1');
     if (PROPS_SAFE) {
@@ -510,6 +525,9 @@ export class CloudbetSource implements Source {
       const game = t.scope === 'esports' ? CLOUDBET_SPORTS[t.sport] : CLOUDBET_TRADITIONAL_SPORTS[t.sport];
       const tradable = ev.status === 'TRADING' || ev.status === 'TRADING_LIVE';
       const markets: CloudbetOdds[] = t.scope === 'esports' ? cloudbetMarkets(t.sport, ev) : cloudbetSportMarkets(t.sport, ev);
+      // O pré-jogo dos esportes só é confirmado na busca completa (~15 MB, a cada
+      // sportsAllIntervalMs): vale até duas buscas perdidas, em vez da TTL curta da casa.
+      const ttlMs = t.scope === 'sports' && !t.live ? (this.opts.sportsAllIntervalMs ?? 60_000) * 2 + 10_000 : undefined;
       for (const odds of markets) {
         const fields = derivedQuoteFields(eventKey, odds.spec, ev.home.name, ev.away.name, game);
         keys.add(fields.key);
@@ -519,6 +537,7 @@ export class CloudbetSource implements Source {
         // Sem mudança só renova o carimbo (mantém o quote "fresco" sem disparar reavaliações).
         if (this.published.get(fields.key) === sig && prev) {
           prev.updatedAt = Date.now();
+          prev.ttlMs = ttlMs;
           continue;
         }
         this.published.set(fields.key, sig);
@@ -531,6 +550,7 @@ export class CloudbetSource implements Source {
           maxStakeB: odds.maxB,
           ...(odds.draw !== undefined ? { oddsDraw: odds.draw, maxStakeDraw: odds.maxDraw } : {}),
           suspended,
+          ttlMs,
         });
       }
     }

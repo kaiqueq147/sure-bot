@@ -139,3 +139,15 @@ test('query de esportes: alias por esporte, limite 50 e offset', () => {
   assert.match(q, /groups\(groups: \["main","half"\]/);
   assert.match(q, /^query StakeSports/);
 });
+
+test('3 vias: NFL no tempo regulamentar, 1º tempo e 1º quarto viram result3', () => {
+  const fx = sportFx([
+    { extId: '1', markets: [smkt('r', '', [['Away FC', 2.2], ['Draw', 30], ['Home FC', 1.7]])] },
+    { extId: '60', markets: [smkt('h', '', [['Home FC', 2.0], ['Draw', 6.5], ['Away FC', 2.3]])] },
+    { extId: '235', markets: [smkt('q1', 'quarternr=1', [['Home FC', 2.1], ['Draw', 7], ['Away FC', 2.2]]), smkt('q2', 'quarternr=2', [['Home FC', 2], ['Draw', 7], ['Away FC', 2]])] },
+  ]);
+  const r3 = stakeSportMarkets('american-football', fx).filter((m) => m.spec.type === 'result3');
+  assert.deepEqual(r3.map((m) => m.spec.period ?? 'ft'), ['ft', 'h1', 'q1'], 'só o 1º quarto do 235');
+  const reg = r3[0];
+  assert.deepEqual([reg.a, reg.draw, reg.b], [1.7, 30, 2.2], 'casa/fora pelo nome, não pela posição');
+});

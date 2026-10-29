@@ -118,10 +118,10 @@ export const config = {
     /** A cada quanto uma volta busca os esportes tradicionais ao vivo */
     sportsLiveIntervalMs: num("CLOUDBET_SPORTS_LIVE_INTERVAL_MS", 5_000),
     /**
-     * A cada quanto uma volta busca todos os jogos dos esportes tradicionais. Precisa ficar
-     * abaixo de CLOUDBET_STALE_MS, senão o pré-jogo envelhece entre uma busca e outra.
+     * A cada quanto uma volta busca todos os jogos dos esportes tradicionais (~15 MB por busca).
+     * O pré-jogo desses esportes vale 2x este intervalo (Quote.ttlMs), não CLOUDBET_STALE_MS.
      */
-    sportsAllIntervalMs: num("CLOUDBET_SPORTS_ALL_INTERVAL_MS", 15_000),
+    sportsAllIntervalMs: num("CLOUDBET_SPORTS_ALL_INTERVAL_MS", 60_000),
     /** Pausa pedida pela Cloudflare num 429, preservada entre reinícios */
     cooldownFile: env(
       "CLOUDBET_COOLDOWN_FILE",
